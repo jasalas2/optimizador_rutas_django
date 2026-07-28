@@ -1,0 +1,163 @@
+{% extends "rutas/_base.html" %}
+{% load static %}
+{% block title %}Puntos — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link href="https://unpkg.com/tabulator-tables@6.3/dist/css/tabulator.min.css" rel="stylesheet">
+<script src="https://unpkg.com/tabulator-tables@6.3/dist/js/tabulator.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Puntos de recolección</h1>
+    <div class="sub">
+      <b>Peso (kg)</b> es la generación DIARIA de ese punto — se suma con el resto de los puntos que le
+      toquen a cada camión al calcular la ruta. La frecuencia real de paso se asigna DESPUÉS de calcular,
+      a la ruta ya armada. Columna <b>Camión</b>: "Auto" deja que el optimizador decida. <b>Cantón</b> y
+      <b>Distrito</b> también sirven para calcular una ruta por separado.
+    </div>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="btn-agregar-fila">+ Agregar fila</button>
+    <label class="btn btn-archivo" for="input-csv">Importar CSV
+      <input type="file" id="input-csv" accept=".csv">
+    </label>
+  </div>
+</div>
+
+<div class="stats" id="metricas"></div>
+<div id="alerta-pesados"></div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Tabla de puntos</h2>
+    <div class="btn-row">
+      <button class="btn ghost" id="btn-geocodificar">Geocodificar direcciones</button>
+      <button class="btn primary" id="btn-guardar">Guardar puntos</button>
+      <span id="estado"></span>
+    </div>
+  </div>
+  <div class="card-body flush">
+    <div id="tabla-puntos"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const camionesOptions = {{ camiones_json|safe }};
+let datosIniciales = {{ puntos_json|safe }};
+let metricasIniciales = {{ metricas_json|safe }};
+
+const table = new Tabulator("#tabla-puntos", {
+  data: datosIniciales,
+  layout: "fitColumns",
+  addRowPos: "bottom",
+  movableRows: false,
+  columns: [
+    {title: "Nombre", field: "Nombre", editor: "input", widthGrow: 2},
+    {title: "Dirección", field: "Dirección", editor: "input", widthGrow: 3},
+    {title: "Latitud", field: "Latitud", editor: "number", editorParams: {step: 0.000001}},
+    {title: "Longitud", field: "Longitud", editor: "number", editorParams: {step: 0.000001}},
+    {title: "Peso (kg)", field: "Peso (kg)", editor: "number", editorParams: {min: 0}},
+    {title: "Camión", field: "Camión", editor: "list", editorParams: {values: camionesOptions}},
+    {title: "Cantón", field: "Cantón", editor: "input"},
+    {title: "Distrito", field: "Distrito", editor: "input"},
+    columnaBorrar(),
+  ],
+});
+
+table.on("tableBuilt", () => table.addRow({}));
+document.getElementById("btn-agregar-fila").addEventListener("click", () => table.addRow({}));
+
+const aliasPuntos = {
+  nombre: "Nombre", direccion: "Dirección", latitud: "Latitud", lat: "Latitud",
+  longitud: "Longitud", lon: "Longitud", lng: "Longitud",
+  pesokg: "Peso (kg)", peso: "Peso (kg)", camion: "Camión",
+  canton: "Cantón", distrito: "Distrito",
+};
+importarCSV("input-csv", ["Latitud", "Longitud", "Peso (kg)"], aliasPuntos, (nuevasFilas) => {
+  table.addData(nuevasFilas);
+  document.getElementById("estado").textContent = `${nuevasFilas.length} fila(s) importadas — revisá y guardá.`;
+});
+
+function pintarMetricas(m) {
+  const cont = document.getElementById("metricas");
+  cont.innerHTML = `
+    <div class="stat ok">
+      <div class="eyebrow">Peso total</div>
+      <div class="val">${m.peso_total.toLocaleString("es-CR", {maximumFractionDigits: 0})} <small>kg</small></div>
+    </div>
+    <div class="stat ${m.excede_capacidad ? "err" : "ok"}">
+      <div class="eyebrow">${m.excede_capacidad ? "Excede capacidad de flota" : "Capacidad de flota"}</div>
+      <div class="val">${m.cap_flota_efectiva.toLocaleString("es-CR", {maximumFractionDigits: 0})} <small>kg</small></div>
+    </div>
+  `;
+
+  const alertaDiv = document.getElementById("alerta-pesados");
+  if (m.puntos_pesados && m.puntos_pesados.length > 0) {
+    let filas = m.puntos_pesados.map(p => `
+      <tr><td>${p["Punto"]}</td><td class="num">${Number(p["Peso (kg)"]).toLocaleString("es-CR")}</td><td>${p["Cabe en algún camión"]}</td></tr>
+    `).join("");
+    alertaDiv.innerHTML = `
+      <div class="msg error">
+        <div>
+          ${m.puntos_pesados.length} punto(s) pesan más que la capacidad de CUALQUIER camión de tu flota —
+          un punto se recoge entero en un solo viaje. El cálculo va a fallar mientras esto no se corrija.
+          <div class="tbl-wrap">
+            <table class="datos">
+              <tr><th>Punto</th><th>Peso (kg)</th><th>Cabe en algún camión</th></tr>
+              ${filas}
+            </table>
+          </div>
+        </div>
+      </div>`;
+  } else {
+    alertaDiv.innerHTML = "";
+  }
+}
+pintarMetricas(metricasIniciales);
+
+function filasNoVacias() {
+  return table.getData().filter(f => (f["Nombre"] || "").trim() !== "");
+}
+
+document.getElementById("btn-guardar").addEventListener("click", async () => {
+  const estado = document.getElementById("estado");
+  estado.textContent = "Guardando...";
+  try {
+    const data = await postJSON("{% url 'rutas:api_guardar_puntos' %}", {filas: filasNoVacias()});
+    table.setData(data.filas);
+    table.addRow({});
+    pintarMetricas(data.metricas);
+    estado.textContent = "Guardados";
+    setTimeout(() => estado.textContent = "", 2000);
+  } catch (e) {
+    estado.textContent = "No se guardó: " + e.message;
+  }
+});
+
+document.getElementById("btn-geocodificar").addEventListener("click", async () => {
+  const estado = document.getElementById("estado");
+  const btn = document.getElementById("btn-geocodificar");
+  btn.disabled = true;
+  estado.textContent = "Geocodificando...";
+  try {
+    const data = await postJSON("{% url 'rutas:api_geocodificar_puntos' %}", {filas: filasNoVacias()});
+    table.setData(data.filas);
+    table.addRow({});
+    pintarMetricas(data.metricas);
+    if (data.errores && data.errores.length > 0) {
+      estado.textContent = "No se pudieron geocodificar: " + data.errores.join("; ");
+    } else {
+      estado.textContent = "Geocodificado";
+      setTimeout(() => estado.textContent = "", 2000);
+    }
+  } catch (e) {
+    estado.textContent = "No se guardó: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+{% endblock %}

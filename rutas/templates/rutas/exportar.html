@@ -1,0 +1,81 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Exportar — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<style>
+  .grid-descargas { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin-top: 0.8rem; }
+  .btn-descarga { display: block; text-align: center; padding: 12px 14px; border: 1px solid var(--border-strong); border-radius: 8px;
+    background: var(--surface); color: var(--text); text-decoration: none; font-size: 13px; font-weight: 600; }
+  .btn-descarga:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .btn-descarga.full { grid-column: 1 / -1; }
+  .links-camion { margin-bottom: 1rem; }
+  .links-camion strong { font-size: 13px; }
+  .links-camion .links { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem; }
+  .link-btn { padding: 5px 10px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface);
+    color: var(--text); text-decoration: none; font-size: 12px; }
+  .link-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+  details.waze ul { margin: 0.4rem 0; padding-left: 1.2rem; font-size: 12.5px; }
+  details.waze li { margin: 0.25rem 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Exportar resultados</h1>
+    <div class="sub">Descargá los datos de la última ruta calculada, o abrí la navegación directo en Google Maps / Waze.</div>
+  </div>
+</div>
+
+{% if not tiene_resultado %}
+  <div class="msg info">Calculá las rutas primero.</div>
+{% else %}
+
+  <div class="card">
+    <div class="card-head"><h2>Datos y SIG</h2></div>
+    <div class="card-body">
+      <div class="grid-descargas">
+        <a class="btn-descarga" href="{% url 'rutas:exportar_csv' %}">↓ CSV (todas las rutas)</a>
+        <a class="btn-descarga" href="{% url 'rutas:exportar_geojson' %}">↓ GeoJSON (QGIS / ArcGIS / web)</a>
+        <a class="btn-descarga" href="{% url 'rutas:exportar_shapefile' %}">↓ Shapefile (.zip)</a>
+        <a class="btn-descarga" href="{% url 'rutas:exportar_gpx' %}">↓ GPX (OsmAnd / Garmin)</a>
+        <a class="btn-descarga full" href="{% url 'rutas:exportar_kml' %}">↓ KML (Google Earth / My Maps)</a>
+      </div>
+      <p class="caption">Shapefile incluye capas <b>rutas_lineas</b> + <b>rutas_puntos</b>, con atributo de camión. GPX trae un track por camión.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Navegación</h2></div>
+    <div class="card-body">
+      <h3 style="font-size:13px;margin:0 0 0.6rem;">Google Maps por camión (segmentos de máx. 10 paradas)</h3>
+      {% for ruta in rutas_google_maps %}
+        <div class="links-camion">
+          <strong>{{ ruta.nombre }}:</strong>
+          <div class="links">
+            {% for label, url in ruta.links %}
+              <a class="link-btn" href="{{ url }}" target="_blank" rel="noopener">{{ label }}</a>
+            {% endfor %}
+          </div>
+        </div>
+      {% endfor %}
+
+      <details class="seccion waze">
+        <summary>Cómo usar con Waze</summary>
+        <p class="caption">Waze no tiene API de multi-paradas. Opciones: <b>(A)</b> links parada por parada abajo, o
+          <b>(B)</b> importar el GPX en <a href="https://osmand.net/" target="_blank" rel="noopener">OsmAnd</a>
+          (gratis), que navega la ruta completa con voz.</p>
+        {% for ruta in rutas_waze %}
+          <strong>{{ ruta.nombre }}:</strong>
+          <ul>
+            {% for parada in ruta.paradas %}
+              <li>Parada {{ parada.orden }} — {{ parada.nombre }} ({{ parada.hora }}):
+                <a href="{{ parada.url }}" target="_blank" rel="noopener">Abrir en Waze</a></li>
+            {% endfor %}
+          </ul>
+        {% endfor %}
+      </details>
+    </div>
+  </div>
+
+{% endif %}
+{% endblock %}

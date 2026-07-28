@@ -1,0 +1,9 @@
+Django>=6.0
+ortools>=9.7
+requests>=2.31
+pandas>=2.0
+pytest>=8.0
+geopandas>=1.0
+shapely>=2.0
+networkx>=3.0
+osmnx>=2.0

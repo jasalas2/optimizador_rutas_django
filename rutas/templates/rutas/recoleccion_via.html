@@ -1,0 +1,221 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Recolección en vía — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  table.tasas input { width: 90px; }
+  table.resultado-via th, table.resultado-via td { text-align: right; }
+  table.resultado-via th:first-child, table.resultado-via td:first-child { text-align: left; }
+  #mapa-via { height: 560px; border-radius: 0 0 10px 10px; }
+  #mapa-via:fullscreen { width: 100%; height: 100%; }
+  .leyenda-via { background: var(--surface); padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); font-size: 12px; line-height: 1.7; color: var(--text); }
+  .leyenda-via span.dot { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 5px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Recolección en vía <span class="chip warn" style="vertical-align:middle;">Beta</span></h1>
+    <div class="sub">
+      Estima kilos EXTRA de residuos según el tipo de calle que atraviesa cada ruta ya calculada. Es
+      un resultado aparte: NO modifica pesos, capacidades ni costos del sistema principal, salvo que
+      actives "sumar como recolección ordinaria".
+    </div>
+  </div>
+</div>
+
+{% if not tiene_resultado %}
+  <div class="msg info">Calculá las rutas primero en Calcular. Esta sección analiza esas rutas, no genera las suyas propias.</div>
+{% else %}
+
+  <div class="card">
+    <div class="card-head"><h2>Tasa de kg extra por kilómetro, según tipo de vía</h2></div>
+    <div class="card-body">
+      <p class="caption" style="margin-top:0;">Los 7 tipos de vía son fijos — solo se edita el "Kg extra por km" de cada uno.</p>
+      <form method="post" action="{% url 'rutas:api_recoleccion_via_calcular' %}">
+        {% csrf_token %}
+        <div class="tbl-wrap">
+          <table class="datos tasas">
+            <tr><th>Tipo de vía (OSM)</th><th>Kg extra por km</th></tr>
+            {% for t in tasas %}
+              <tr>
+                <td>{{ t.tipo }}</td>
+                <td><input type="number" step="0.01" min="0" name="tasa__{{ t.tipo }}" value="{{ t.kg_extra_por_km }}"></td>
+              </tr>
+            {% endfor %}
+          </table>
+        </div>
+        <p class="caption">motorway=autopista, trunk=vía troncal, primary=ruta principal, secondary=ruta secundaria, tertiary=calle colectora, residential=calle de barrio, otro=cualquier otro tipo.</p>
+
+        <div class="check">
+          <input type="checkbox" id="sumar_a_recoleccion" name="sumar_a_recoleccion" {% if sumar_a_recoleccion %}checked{% endif %}>
+          <label for="sumar_a_recoleccion">Sumar este kg extra a la cantidad total recolectada</label>
+        </div>
+        <p class="help">
+          Si está activo, el kg extra se suma al peso recolectado de cada camión y se refleja en
+          Costos (toneladas del modelo nuevo). Si está apagado (por defecto), queda solo como referencia.
+        </p>
+        <button type="submit" class="btn primary" style="margin-top:0.6rem;">Calcular kg extra por tipo de vía</button>
+      </form>
+    </div>
+  </div>
+
+  {% if tiene_via_resultado %}
+    <div class="card">
+      <div class="card-head"><h2>Resultado (aparte del sistema principal)</h2></div>
+      <div class="card-body flush">
+        <div class="tbl-wrap" id="tabla-resultado-via"></div>
+      </div>
+      <div class="card-body">
+        <div class="stats">
+          <div class="stat"><div class="eyebrow">Km ruta real</div><div class="val">{{ total_km_real|floatformat:2 }} <small>km</small></div></div>
+          <div class="stat"><div class="eyebrow">Km clasificados (dedup)</div><div class="val">{{ total_km_dedup|floatformat:2 }} <small>km</small></div></div>
+          <div class="stat"><div class="eyebrow">Km clasificados (sin dedup)</div><div class="val">{{ total_km_sin_dedup|floatformat:2 }} <small>km</small></div></div>
+          <div class="stat ok"><div class="eyebrow">Total kg extra estimados</div><div class="val">{{ total_kg_extra|floatformat:2 }} <small>kg</small></div></div>
+        </div>
+
+        {% if muy_por_debajo %}
+          <div class="msg warning">
+            Los km clasificados (con deduplicación) son MUCHO menores que la distancia real de las
+            rutas — lo más probable es que varios camiones compartan tramos de calle. Es el
+            comportamiento esperado de la deduplicación; mirá "Km clasificados (sin dedup)" si preferís
+            ver cada camión por separado.
+          </div>
+        {% endif %}
+
+        {% if sumar_a_recoleccion %}
+          <p class="caption">Está activo "sumar como recolección ordinaria": este kg extra SÍ se refleja en Costos — ver el detalle progresivo abajo.</p>
+        {% else %}
+          <p class="caption">Este total NO se suma a Costos ni a Resultados — es solo informativo.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div id="detalle-progresivo-via"></div>
+
+    <div class="card">
+      <div class="card-head"><h2>Mapa: tipo de vía identificado en cada tramo</h2></div>
+      <div class="card-body" style="padding-bottom:0;">
+        <p class="caption" style="margin-top:0;">
+          El control de capas (arriba a la derecha) activa/desactiva "Contado" o "Saltado" de cada camión.
+        </p>
+      </div>
+      <div class="card-body flush">
+        <div id="mapa-via"></div>
+      </div>
+    </div>
+
+    <script>
+    const resultadosVia = {{ resultados_via_json|safe }};
+    const tramosMapa = {{ tramos_mapa_json|safe }};
+    const detalleProgresivo = {{ detalle_progresivo_json|safe }};
+    const tipoViaColor = {{ tipo_via_color_json|safe }};
+    const tiposViaDefault = {{ tipos_via_default_json|safe }};
+
+    // ── Tabla de resultado por camión ──
+    const colsBase = ["Camion", "Km ruta real (Resultados)", "Km clasificados (dedup)",
+                       "Km clasificados (sin dedup)", "Kg extra estimados"];
+    const colsTipo = Object.keys(resultadosVia[0] || {}).filter(k => k.startsWith("km en "));
+    const cols = colsBase.concat(colsTipo);
+    let html = "<table class='datos resultado-via'><tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr>";
+    resultadosVia.forEach(fila => {
+      html += "<tr>" + cols.map(c => `<td class="num">${fila[c]}</td>`).join("") + "</tr>";
+    });
+    html += "</table>";
+    document.getElementById("tabla-resultado-via").innerHTML = html;
+
+    // ── Detalle progresivo ──
+    if (detalleProgresivo) {
+      const cont = document.getElementById("detalle-progresivo-via");
+      let out = `<div class="card"><div class="card-head"><h2>Detalle progresivo: cómo se va llenando cada camión</h2></div>
+        <div class="card-body"><p class="caption" style="margin-top:0;">Parada por parada, sumando lo recogido en los puntos MAS lo estimado en el camino hasta ahí.</p>`;
+      for (const [nombreCamion, filas] of Object.entries(detalleProgresivo)) {
+        const filasHtml = filas.map(f => `
+          <tr><td>${f["Orden"]}</td><td>${f["Nombre"]}</td><td class="num">${f["Peso puntos acum. (kg)"]}</td>
+          <td class="num">${f["Kg extra via (tramo)"]}</td><td class="num">${f["Peso TOTAL acumulado (kg)"]}</td></tr>`).join("");
+        out += `<details class="seccion"><summary>${nombreCamion} — detalle progresivo</summary>
+          <div class="tbl-wrap"><table class="datos" style="margin-top:0.6rem;">
+            <tr><th>Orden</th><th>Nombre</th><th>Peso puntos acum. (kg)</th><th>Kg extra vía (tramo)</th><th>Peso TOTAL acumulado (kg)</th></tr>
+            ${filasHtml}
+          </table></div></details>`;
+      }
+      out += `</div></div>`;
+      cont.innerHTML = out;
+    }
+
+    // ── Mapa ──
+    if (tramosMapa && tramosMapa.length) {
+      const latsTodas = tramosMapa.flatMap(t => [t.lat1, t.lat2]);
+      const lonsTodas = tramosMapa.flatMap(t => [t.lon1, t.lon2]);
+      const centro = [latsTodas.reduce((a,b)=>a+b,0)/latsTodas.length, lonsTodas.reduce((a,b)=>a+b,0)/lonsTodas.length];
+      const mapaVia = L.map("mapa-via").setView(centro, 12);
+      mapaVia.attributionControl.setPrefix(false);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OpenStreetMap contributors"}).addTo(mapaVia);
+
+      const kmPorCapa = {};
+      tramosMapa.forEach(t => {
+        const clave = `${t.camion}||${t.contado}`;
+        kmPorCapa[clave] = (kmPorCapa[clave] || 0) + t.dist_m / 1000;
+      });
+      const capas = {};
+      tramosMapa.forEach(t => {
+        const clave = `${t.camion}||${t.contado}`;
+        if (!capas[clave]) capas[clave] = L.layerGroup();
+        const color = t.contado ? (tipoViaColor[t.tipo] || "#7F8C8D") : "#B0B0B0";
+        L.polyline([[t.lat1, t.lon1], [t.lat2, t.lon2]], {
+          color, weight: t.contado ? 5 : 3, opacity: t.contado ? 0.85 : 0.5,
+          dashArray: t.contado ? null : "6,6",
+        }).bindTooltip(`${t.camion} · ${t.tipo} · ${t.contado ? "contado" : "SALTADO (ya contado antes)"} · ${(t.dist_m/1000).toFixed(3)} km`)
+          .addTo(capas[clave]);
+      });
+      const overlays = {};
+      Object.entries(capas).forEach(([clave, capa]) => {
+        const [camion, contado] = clave.split("||");
+        const estadoTxt = contado === "true" ? "Contado" : "Saltado (repetido)";
+        const nombreCapa = `${camion} — ${estadoTxt} (${kmPorCapa[clave].toFixed(2)} km)`;
+        overlays[nombreCapa] = capa;
+        capa.addTo(mapaVia);
+      });
+      L.control.layers(null, overlays, {collapsed: false, position: "topright"}).addTo(mapaVia);
+
+      const leyenda = L.control({position: "bottomleft"});
+      leyenda.onAdd = function() {
+        const div = L.DomUtil.create("div", "leyenda-via");
+        div.innerHTML = "<b>Tipo de vía</b><br>" + tiposViaDefault.map(t =>
+          `<span class="dot" style="background:${tipoViaColor[t]};"></span>${t}<br>`).join("");
+        return div;
+      };
+      leyenda.addTo(mapaVia);
+
+      (function agregarPantallaCompleta(mapaLeaflet) {
+        const FullscreenControl = L.Control.extend({
+          options: {position: "topright"},
+          onAdd: function () {
+            const btn = L.DomUtil.create("button", "leaflet-bar leaflet-control leaflet-control-fullscreen");
+            btn.type = "button";
+            btn.title = "Pantalla completa";
+            btn.style.width = "30px"; btn.style.height = "30px";
+            const actualizarIcono = () => { btn.innerHTML = document.fullscreenElement ? "✕" : "⛶"; };
+            actualizarIcono();
+            L.DomEvent.on(btn, "click", (e) => {
+              L.DomEvent.stop(e);
+              if (!document.fullscreenElement) mapaLeaflet.getContainer().requestFullscreen();
+              else document.exitFullscreen();
+            });
+            document.addEventListener("fullscreenchange", () => {
+              actualizarIcono();
+              setTimeout(() => mapaLeaflet.invalidateSize(), 100);
+            });
+            L.DomEvent.disableClickPropagation(btn);
+            return btn;
+          },
+        });
+        mapaLeaflet.addControl(new FullscreenControl());
+      })(mapaVia);
+    }
+    </script>
+  {% endif %}
+{% endif %}
+{% endblock %}

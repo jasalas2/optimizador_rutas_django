@@ -1,0 +1,62 @@
+{% load static %}<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<script>
+  (function() {
+    var t = localStorage.getItem("rutas-tema");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
+<title>{% block title %}Optimizador de Rutas{% endblock %}</title>
+<link rel="stylesheet" href="{% static 'rutas/style.css' %}">
+{% block extra_head %}{% endblock %}
+</head>
+<body>
+<div class="shell">
+  <nav class="rail">
+    <a class="rail-brand" href="{% url 'rutas:puntos' %}">
+      <div class="mark">OR</div>
+      <div class="name">Optimizador<span>Rutas de Recolección</span></div>
+    </a>
+
+    <div class="rail-group">
+      <div class="eyebrow">Datos</div>
+      <a class="rail-link {% if request.resolver_match.url_name == 'puntos' %}activa{% endif %}" href="{% url 'rutas:puntos' %}"><span class="ic">●</span> Puntos</a>
+      <a class="rail-link {% if request.resolver_match.url_name == 'camiones' %}activa{% endif %}" href="{% url 'rutas:camiones' %}"><span class="ic">▤</span> Camiones</a>
+    </div>
+
+    <div class="rail-group">
+      <div class="eyebrow">Operación</div>
+      <a class="rail-link {% if request.resolver_match.url_name == 'calcular' %}activa{% endif %}" href="{% url 'rutas:calcular' %}"><span class="ic">▶</span> Calcular</a>
+      <a class="rail-link {% if request.resolver_match.url_name == 'costos' %}activa{% endif %}" href="{% url 'rutas:costos' %}"><span class="ic">₡</span> Costos</a>
+      <a class="rail-link {% if request.resolver_match.url_name == 'exportar' %}activa{% endif %}" href="{% url 'rutas:exportar' %}"><span class="ic">↓</span> Exportar</a>
+    </div>
+
+    <div class="rail-group">
+      <div class="eyebrow">Beta</div>
+      <a class="rail-link beta {% if request.resolver_match.url_name == 'red_propia' %}activa{% endif %}" href="{% url 'rutas:red_propia' %}"><span class="ic">≈</span> Red propia</a>
+      <a class="rail-link beta {% if request.resolver_match.url_name == 'recoleccion_via' %}activa{% endif %}" href="{% url 'rutas:recoleccion_via' %}"><span class="ic">◇</span> Recol. en vía</a>
+    </div>
+
+    <div class="rail-foot">
+      <a class="rail-link {% if request.resolver_match.url_name == 'configuracion' %}activa{% endif %}" href="{% url 'rutas:configuracion' %}"><span class="ic">⚙</span> Configuración</a>
+      <div class="theme-toggle">
+        <button type="button" id="btn-tema-claro">Claro</button>
+        <button type="button" id="btn-tema-oscuro">Oscuro</button>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    {% for message in messages %}
+      <div class="msg {{ message.tags }}">{{ message }}</div>
+    {% endfor %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<script src="{% static 'rutas/app.js' %}"></script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>

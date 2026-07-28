@@ -1,0 +1,254 @@
+{% extends "rutas/_base.html" %}
+{% load static %}
+{% block title %}Costos — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link href="https://unpkg.com/tabulator-tables@6.3/dist/css/tabulator.min.css" rel="stylesheet">
+<script src="https://unpkg.com/tabulator-tables@6.3/dist/js/tabulator.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Comparación de modelos de ruta</h1>
+    <div class="sub">
+      El costo del modelo nuevo se calcula a partir de la estructura de costos de más abajo (no se
+      escribe a mano). El modelo actual se compara sobre las toneladas netas, restando lo que ya
+      absorbe el modelo nuevo.
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post" action="{% url 'rutas:api_guardar_toneladas' %}">
+      {% csrf_token %}
+      <div class="fila-2">
+        <div>
+          <h2 style="font-size:14px;">Modelo actual</h2>
+          <label for="ton_actual">Toneladas recolectadas — modelo actual (total histórico)</label>
+          <input type="number" id="ton_actual" name="ton_actual" min="0" step="0.5" value="{{ config.ton_actual }}">
+          <label for="precio_actual">Precio por tonelada (CRC) — modelo actual</label>
+          <input type="number" id="precio_actual" name="precio_actual" min="0" step="1000" value="{{ config.precio_ton_actual }}">
+        </div>
+        <div>
+          <h2 style="font-size:14px;">Modelo nuevo (rutas optimizadas)</h2>
+          <label for="ton_nuevo">Toneladas recolectadas — modelo nuevo</label>
+          <input type="number" id="ton_nuevo" name="ton_nuevo" min="0" step="0.5" value="{{ ton_nuevo|floatformat:2 }}">
+          {% if toneladas_ruta %}
+            <div class="help">Se pre-llena con el peso total de las rutas calculadas ({{ toneladas_ruta|floatformat:2 }} ton).</div>
+          {% endif %}
+          {% if kg_extra_via_sumado > 0 %}
+            <div class="help">Incluye {{ kg_extra_via_sumado|floatformat:2 }} kg extra de "Recolección en vía".</div>
+          {% endif %}
+          <div class="stat" style="margin-top:0.8rem;">
+            <div class="eyebrow">Precio por tonelada — modelo nuevo, calculado</div>
+            <div class="val">{% if tiene_resultado %}CRC {{ costo_por_tonelada|floatformat:2 }}{% else %}—{% endif %}</div>
+            {% if not tiene_resultado %}<div class="sub">Calculá las rutas primero.</div>{% endif %}
+          </div>
+        </div>
+      </div>
+      <button type="submit" class="btn primary" style="margin-top:1.2rem;">Guardar toneladas</button>
+    </form>
+  </div>
+</div>
+
+<h2 style="margin-top:2.2rem;">Estructura de costos</h2>
+<p class="caption">
+  Todo lo que aparece acá se suma para calcular el costo operativo diario, y de ahí el costo real
+  por tonelada del modelo nuevo.
+</p>
+
+<details class="seccion" open>
+  <summary>Inversión (camiones, garaje, otros)</summary>
+  <p class="caption">Montos grandes de compra/construcción, prorrateados por su vida útil. Ej: un camión de
+    ₡25.000.000 con 10 años de vida útil aporta ≈ ₡6.849/día al costo operativo.</p>
+  <div id="tabla-inversion"></div>
+  <div class="btn-row" style="margin-top:0.8rem;">
+    <button class="btn primary" id="btn-guardar-inversion">Guardar inversión</button>
+    <span id="estado-inversion"></span>
+  </div>
+  <p class="caption">Subtotal inversión: CRC <span id="subtotal-inversion">{{ costo_inversion_dia|floatformat:2 }}</span> / día</p>
+</details>
+
+<details class="seccion" open>
+  <summary>Mano de obra</summary>
+  <form method="post" action="{% url 'rutas:api_guardar_mano_obra' %}">
+    {% csrf_token %}
+    <div class="fila-2">
+      <div>
+        <label for="horas_laboradas">Horas laboradas (jornada)</label>
+        <input type="number" id="horas_laboradas" name="horas_laboradas" min="0" step="0.5" value="{{ config.horas_laboradas }}">
+        <div class="help">Horas que trabaja la cuadrilla/chofer en la jornada.</div>
+      </div>
+      <div>
+        <label for="precio_hora">Precio por hora del trabajador (CRC)</label>
+        <input type="number" id="precio_hora" name="precio_hora" min="0" step="100" value="{{ config.precio_hora }}">
+        <div class="help">Costo real por hora, incluyendo cargas sociales/CCSS.</div>
+      </div>
+    </div>
+    <button type="submit" class="btn primary" style="margin-top:0.8rem;">Guardar mano de obra</button>
+  </form>
+  <p class="caption" style="margin-top:0.8rem;">Se multiplica por la cantidad de personas de los camiones usados en la ruta calculada.</p>
+</details>
+
+<details class="seccion" open>
+  <summary>Combustible y variables por km</summary>
+  <form method="post" action="{% url 'rutas:api_guardar_combustible' %}">
+    {% csrf_token %}
+    <div class="fila-2">
+      <div>
+        <label for="rendimiento">Rendimiento del camión (km por litro)</label>
+        <input type="number" id="rendimiento" name="rendimiento" min="0.1" step="0.5" value="{{ config.rendimiento }}">
+        <label for="precio_litro">Precio del combustible (CRC por litro)</label>
+        <input type="number" id="precio_litro" name="precio_litro" min="0" step="10" value="{{ config.precio_litro }}">
+      </div>
+      <div>
+        <label for="costo_km_extra">Otros costos por km (CRC) — llantas, desgaste</label>
+        <input type="number" id="costo_km_extra" name="costo_km_extra" min="0" step="10" value="{{ config.costo_km_extra }}">
+      </div>
+    </div>
+    <button type="submit" class="btn primary" style="margin-top:0.8rem;">Guardar combustible</button>
+  </form>
+</details>
+
+<details class="seccion">
+  <summary>Mantenimiento (lavacar, extintores, etc.)</summary>
+  <div id="tabla-mantenimiento"></div>
+  <div class="btn-row" style="margin-top:0.8rem;">
+    <button class="btn primary" id="btn-guardar-mantenimiento">Guardar mantenimiento</button>
+    <span id="estado-mantenimiento"></span>
+  </div>
+  <p class="caption">Subtotal mantenimiento: CRC <span id="subtotal-mantenimiento">{{ costo_mantenimiento_dia|floatformat:2 }}</span> / día</p>
+</details>
+
+<details class="seccion">
+  <summary>Administrativa (contabilidad, permisos, seguros...)</summary>
+  <div id="tabla-administrativa"></div>
+  <div class="btn-row" style="margin-top:0.8rem;">
+    <button class="btn primary" id="btn-guardar-administrativa">Guardar administrativa</button>
+    <span id="estado-administrativa"></span>
+  </div>
+  <p class="caption">Subtotal administrativa: CRC <span id="subtotal-administrativa">{{ costo_administrativa_dia|floatformat:2 }}</span> / día</p>
+</details>
+
+{% if not tiene_resultado %}
+  <div class="msg info">Calculá las rutas para obtener el costo por tonelada (se necesitan los km recorridos).</div>
+{% else %}
+  <h2 style="margin-top:2.2rem;">Costo operativo diario total</h2>
+  <p class="caption"><b>Base del cálculo:</b> {{ km_total|floatformat:1 }} km recorridos · {{ litros|floatformat:1 }} litros estimados · {{ ton_nuevo|floatformat:2 }} ton recolectadas</p>
+  <div class="stats">
+    <div class="stat"><div class="eyebrow">Combustible + variables</div><div class="val">CRC {{ costo_combustible|add:costo_variable|floatformat:2 }}</div></div>
+    <div class="stat"><div class="eyebrow">Mano de obra</div><div class="val">CRC {{ costo_mano_obra|floatformat:2 }}</div>
+      <div class="sub">{{ config.horas_laboradas|floatformat:2 }} h x CRC {{ config.precio_hora|floatformat:2 }} x {{ personas_total }} persona(s)</div></div>
+    <div class="stat"><div class="eyebrow">Inversión + Mant. + Admin.</div><div class="val">CRC {{ costo_inversion_dia|add:costo_mantenimiento_dia|add:costo_administrativa_dia|floatformat:2 }}</div></div>
+    <div class="stat ok"><div class="eyebrow">Costo real por tonelada</div><div class="val">CRC {{ costo_por_tonelada|floatformat:2 }}</div></div>
+  </div>
+
+  <details class="seccion">
+    <summary>Ver desglose completo</summary>
+    <div class="tbl-wrap">
+      <table class="datos">
+        <tr><th>Concepto</th><th>Monto (CRC)</th><th>Detalle</th></tr>
+        {% for fila in desglose %}
+          <tr {% if "TOTAL" in fila.concepto %}class="total"{% endif %}>
+            <td>{{ fila.concepto }}</td>
+            <td class="num">{{ fila.monto|floatformat:2 }}</td>
+            <td>{{ fila.detalle }}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+  </details>
+{% endif %}
+
+<hr class="div">
+
+<h2>Resultado de la comparación</h2>
+<p class="caption">
+  <b>Toneladas netas del modelo actual:</b> {{ config.ton_actual|floatformat:2 }} ton (total histórico)
+  − {{ ton_nuevo|floatformat:2 }} ton (absorbidas por el nuevo modelo) = <b>{{ ton_actual_neta|floatformat:2 }} ton</b>
+</p>
+<p class="caption">El costo del modelo actual se calcula sobre las toneladas netas, ya que las toneladas que
+  recoge el modelo nuevo ya no están disponibles para el modelo actual.</p>
+<div class="stats">
+  <div class="stat">
+    <div class="eyebrow">Costo modelo actual (neto)</div>
+    <div class="val">CRC {{ costo_modelo_actual|floatformat:2 }}</div>
+    <div class="sub">{{ ton_actual_neta|floatformat:2 }} ton x CRC {{ config.precio_ton_actual|floatformat:2 }}</div>
+  </div>
+  <div class="stat">
+    <div class="eyebrow">Costo modelo nuevo</div>
+    <div class="val">CRC {{ costo_modelo_nuevo|floatformat:2 }}</div>
+    <div class="sub">{{ ton_nuevo|floatformat:2 }} ton x CRC {{ costo_por_tonelada|floatformat:2 }}</div>
+  </div>
+  <div class="stat {% if diferencia >= 0 %}ok{% else %}err{% endif %}">
+    <div class="eyebrow">Diferencia (ahorro)</div>
+    <div class="val">CRC {{ diferencia|floatformat:2 }}</div>
+    {% if diferencia_pct is not None %}<div class="sub">{{ diferencia_pct|floatformat:1 }}%</div>{% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function crearTablaInversion() {
+  const table = new Tabulator("#tabla-inversion", {
+    data: {{ inversion_json|safe }},
+    layout: "fitColumns",
+    addRowPos: "bottom",
+    columns: [
+      {title: "Concepto", field: "Concepto", editor: "input", widthGrow: 2},
+      {title: "Monto total (CRC)", field: "Monto total (CRC)", editor: "number", editorParams: {min: 0}},
+      {title: "Vida útil (años)", field: "Vida útil (años)", editor: "number", editorParams: {min: 0.1, step: 0.5}},
+      columnaBorrar(),
+    ],
+  });
+  table.on("tableBuilt", () => table.addRow({}));
+  document.getElementById("btn-guardar-inversion").addEventListener("click", async () => {
+    const estado = document.getElementById("estado-inversion");
+    estado.textContent = "Guardando...";
+    const filas = table.getData().filter(f => (f["Concepto"] || "").trim() !== "");
+    try {
+      const data = await postJSON("{% url 'rutas:api_guardar_inversion' %}", {filas});
+      table.setData(data.filas);
+      table.addRow({});
+      document.getElementById("subtotal-inversion").textContent = data.costo_dia.toFixed(2);
+      estado.textContent = "Inversión guardada.";
+      setTimeout(() => estado.textContent = "", 2500);
+    } catch (e) { estado.textContent = "No se guardó: " + e.message; }
+  });
+}
+
+function crearTablaRecurrente(elId, data, btnId, estadoId, subtotalId, urlGuardar) {
+  const table = new Tabulator(elId, {
+    data: data,
+    layout: "fitColumns",
+    addRowPos: "bottom",
+    columns: [
+      {title: "Concepto", field: "Concepto", editor: "input", widthGrow: 2},
+      {title: "Monto (CRC)", field: "Monto (CRC)", editor: "number", editorParams: {min: 0}},
+      {title: "Frecuencia", field: "Frecuencia", editor: "list", editorParams: {values: ["Día", "Semana", "Mes", "Año"]}},
+      columnaBorrar(),
+    ],
+  });
+  table.on("tableBuilt", () => table.addRow({}));
+  document.getElementById(btnId).addEventListener("click", async () => {
+    const estado = document.getElementById(estadoId);
+    estado.textContent = "Guardando...";
+    const filas = table.getData().filter(f => (f["Concepto"] || "").trim() !== "");
+    try {
+      const data = await postJSON(urlGuardar, {filas});
+      table.setData(data.filas);
+      table.addRow({});
+      document.getElementById(subtotalId).textContent = data.costo_dia.toFixed(2);
+      estado.textContent = "Guardado.";
+      setTimeout(() => estado.textContent = "", 2500);
+    } catch (e) { estado.textContent = "No se guardó: " + e.message; }
+  });
+}
+
+crearTablaInversion();
+crearTablaRecurrente("#tabla-mantenimiento", {{ mantenimiento_json|safe }}, "btn-guardar-mantenimiento", "estado-mantenimiento", "subtotal-mantenimiento", "{% url 'rutas:api_guardar_recurrente' tipo='mantenimiento' %}");
+crearTablaRecurrente("#tabla-administrativa", {{ administrativa_json|safe }}, "btn-guardar-administrativa", "estado-administrativa", "subtotal-administrativa", "{% url 'rutas:api_guardar_recurrente' tipo='administrativa' %}");
+</script>
+{% endblock %}

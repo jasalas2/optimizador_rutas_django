@@ -1,0 +1,177 @@
+{% extends "rutas/_base.html" %}
+{% load static %}
+{% block title %}Red propia — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link href="https://unpkg.com/tabulator-tables@6.3/dist/css/tabulator.min.css" rel="stylesheet">
+<script src="https://unpkg.com/tabulator-tables@6.3/dist/js/tabulator.min.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  #mapa-red { height: 500px; border-radius: 0 0 10px 10px; }
+  #mapa-red:fullscreen { width: 100%; height: 100%; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Red propia <span class="chip warn" style="vertical-align:middle;">Beta</span></h1>
+    <div class="sub">
+      Independiente del optimizador principal (que usa OSRM y Puntos/Camiones/Calcular). Acá subís
+      tu propia red de calles como shapefile de líneas, y la app calcula la mejor ruta recorriendo
+      esa red.
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>1. Subí tu capa de líneas</h2></div>
+  <div class="card-body">
+    <p class="caption" style="margin-top:0;">
+      Formatos aceptados: <b>(A)</b> un .zip con el shapefile adentro, <b>(B)</b> los archivos
+      .shp + .shx + .dbf sueltos, <b>(C)</b> un .geojson, o <b>(D)</b> un .gpkg.
+    </p>
+    <form method="post" action="{% url 'rutas:api_red_propia_cargar' %}" enctype="multipart/form-data">
+      {% csrf_token %}
+      <label for="archivos">Capa de líneas</label>
+      <input type="file" id="archivos" name="archivos" multiple accept=".zip,.shp,.shx,.dbf,.prj,.geojson,.json,.gpkg">
+      <label for="tolerancia_m">Tolerancia de conexión entre líneas (metros)</label>
+      <input type="number" id="tolerancia_m" name="tolerancia_m" min="0.5" max="100" step="0.5" value="5.0">
+      <div class="help">Dos extremos de línea a menos de esta distancia se tratan como el mismo cruce.</div>
+      <button type="submit" class="btn primary" style="margin-top:1rem;">Cargar red</button>
+    </form>
+  </div>
+</div>
+
+{% if tiene_grafo %}
+  <div class="stats">
+    <div class="stat"><div class="eyebrow">Líneas leídas</div><div class="val">{{ info.n_lineas }}</div></div>
+    <div class="stat"><div class="eyebrow">Nodos de la red</div><div class="val">{{ info.nodos_json|length }}</div></div>
+    <div class="stat {% if info.n_componentes > 1 %}warn{% else %}ok{% endif %}"><div class="eyebrow">Componentes conectados</div><div class="val">{{ info.n_componentes }}</div></div>
+  </div>
+  {% if info.n_componentes > 1 %}
+    <div class="msg warning">
+      La red tiene {{ info.n_componentes }} partes NO conectadas entre sí (tamaños:
+      {{ info.tamano_componentes_json|slice:":3" }} nodos). Si dos de tus puntos caen en partes
+      distintas, la app va a usar línea recta entre ellos.
+    </div>
+  {% else %}
+    <div class="msg success">✓ La red quedó como un solo componente conectado.</div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-head">
+      <h2>2. Puntos a recorrer</h2>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-guardar-puntos-red">Guardar puntos</button>
+        <span id="estado-puntos-red"></span>
+      </div>
+    </div>
+    <div class="card-body flush">
+      <div id="tabla-puntos-red"></div>
+    </div>
+    <div class="card-body">
+      <p class="caption" style="margin:0;">
+        El <b>primer punto de la lista</b> se usa como salida y llegada (recorrido circular). Se
+        calcula un solo recorrido — esta sección beta todavía no reparte entre varios camiones.
+      </p>
+      <form method="post" action="{% url 'rutas:api_red_propia_calcular' %}" id="form-calcular-red">
+        {% csrf_token %}
+        <button type="submit" class="btn primary" style="margin-top:0.8rem;">Calcular ruta sobre esta red</button>
+      </form>
+    </div>
+  </div>
+
+  {% if resultado %}
+    <div class="card">
+      <div class="card-head"><h2>3. Resultado</h2></div>
+      <div class="card-body">
+        {% if resultado.pares_sin_red %}
+          <div class="msg warning">
+            Estos pares de puntos NO tienen camino por tu red (se usó línea recta entre ellos):
+            {% for par in resultado.pares_sin_red %}{{ par.0 }} ↔ {{ par.1 }}{% if not forloop.last %}; {% endif %}{% endfor %}.
+          </div>
+        {% endif %}
+        <div class="stats" style="margin-bottom:8px;">
+          <div class="stat ok"><div class="eyebrow">Distancia total de la ruta</div><div class="val">{{ resultado.dist_total_m|floatformat:0 }} <small>m</small></div></div>
+        </div>
+        <p class="caption" style="margin:0 0 4px;"><b>Orden de la ruta:</b> {{ resultado.nombres|join:" → " }}</p>
+      </div>
+      <div class="card-body flush">
+        <div id="mapa-red"></div>
+      </div>
+    </div>
+
+    <script>
+    const resultadoRed = {{ resultado_json|safe }};
+    const centro = [resultadoRed.puntos_lonlat[0][1], resultadoRed.puntos_lonlat[0][0]];
+    const mapaRed = L.map("mapa-red").setView(centro, 13);
+    mapaRed.attributionControl.setPrefix(false);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OpenStreetMap contributors"}).addTo(mapaRed);
+    const camino = resultadoRed.camino.map(p => [p[1], p[0]]);
+    L.polyline(camino, {color: "#1FA98C", weight: 4, opacity: 0.85}).addTo(mapaRed);
+    resultadoRed.orden_nodos.forEach((nodeIdx, i) => {
+      const [lon, lat] = resultadoRed.puntos_lonlat[nodeIdx];
+      L.marker([lat, lon]).addTo(mapaRed)
+        .bindPopup(`${i}. ${resultadoRed.nombres_todos[nodeIdx]}`)
+        .bindTooltip(`${i}. ${resultadoRed.nombres_todos[nodeIdx]}`);
+    });
+
+    (function agregarPantallaCompleta(mapaLeaflet) {
+      const FullscreenControl = L.Control.extend({
+        options: {position: "topright"},
+        onAdd: function () {
+          const btn = L.DomUtil.create("button", "leaflet-bar leaflet-control leaflet-control-fullscreen");
+          btn.type = "button";
+          btn.title = "Pantalla completa";
+          btn.style.width = "30px"; btn.style.height = "30px";
+          const actualizarIcono = () => { btn.innerHTML = document.fullscreenElement ? "✕" : "⛶"; };
+          actualizarIcono();
+          L.DomEvent.on(btn, "click", (e) => {
+            L.DomEvent.stop(e);
+            if (!document.fullscreenElement) mapaLeaflet.getContainer().requestFullscreen();
+            else document.exitFullscreen();
+          });
+          document.addEventListener("fullscreenchange", () => {
+            actualizarIcono();
+            setTimeout(() => mapaLeaflet.invalidateSize(), 100);
+          });
+          L.DomEvent.disableClickPropagation(btn);
+          return btn;
+        },
+      });
+      mapaLeaflet.addControl(new FullscreenControl());
+    })(mapaRed);
+    </script>
+  {% endif %}
+
+  <script>
+  const datosIniciales = {{ puntos_json|safe }};
+  const tablePuntosRed = new Tabulator("#tabla-puntos-red", {
+    data: datosIniciales,
+    layout: "fitColumns",
+    addRowPos: "bottom",
+    columns: [
+      {title: "Nombre", field: "Nombre", editor: "input", widthGrow: 2},
+      {title: "Latitud", field: "Latitud", editor: "number", editorParams: {step: 0.000001}},
+      {title: "Longitud", field: "Longitud", editor: "number", editorParams: {step: 0.000001}},
+      columnaBorrar(),
+    ],
+  });
+  tablePuntosRed.on("tableBuilt", () => tablePuntosRed.addRow({}));
+
+  document.getElementById("btn-guardar-puntos-red").addEventListener("click", async () => {
+    const estado = document.getElementById("estado-puntos-red");
+    estado.textContent = "Guardando...";
+    const filas = tablePuntosRed.getData().filter(f => (f["Nombre"] || "").trim() !== "");
+    try {
+      const data = await postJSON("{% url 'rutas:api_red_propia_guardar_puntos' %}", {filas});
+      tablePuntosRed.setData(data.filas);
+      tablePuntosRed.addRow({});
+      estado.textContent = "Guardados";
+      setTimeout(() => estado.textContent = "", 2000);
+    } catch (e) { estado.textContent = "No se guardó: " + e.message; }
+  });
+  </script>
+{% endif %}
+{% endblock %}

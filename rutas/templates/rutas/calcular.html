@@ -1,0 +1,459 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Calcular — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  .radios { display: flex; gap: 1.2rem; flex-wrap: wrap; margin: 0.6rem 0 1rem; }
+  .radios label { font-size: 13px; display: flex; align-items: center; gap: 0.4rem; font-weight: 500; }
+  #tabla-mixto { margin: 0.6rem 0 1rem; }
+  .fila-mixto { display: flex; align-items: center; gap: 0.8rem; padding: 0.4rem 0; }
+  .fila-mixto span { width: 220px; font-size: 13px; }
+  .fila-ruta { display: flex; align-items: center; gap: 1rem; padding: 10px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .fila-ruta:last-child { border-bottom: none; }
+  .fila-ruta strong { width: 200px; font-size: 12.5px; flex-shrink: 0; }
+  .fila-ruta .dias-fila { display: flex; gap: 5px; }
+  .fila-ruta .dias-fila label { font-size: 11px; display: flex; flex-direction: column; align-items: center; gap: 2px; color: var(--text-muted); }
+  #mapa { height: 640px; border-radius: 0 0 10px 10px; }
+  #mapa:fullscreen { width: 100%; height: 100%; }
+  #rutas-selector { display: flex; flex-wrap: wrap; gap: 0.8rem; padding: 12px 18px; font-size: 12.5px; border-bottom: 1px solid var(--border); }
+  #rutas-selector label { display: flex; align-items: center; gap: 0.4rem; }
+  .detalle-metricas { display: flex; gap: 1.2rem; margin: 10px 0 14px; flex-wrap: wrap; font-size: 12.5px; }
+  .detalle-metricas div { min-width: 130px; }
+  .detalle-metricas .label { color: var(--text-muted); font-size: 11px; }
+  .detalle-metricas .valor { font-weight: 600; }
+  details.seccion summary::marker { color: var(--text-faint); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Calcular rutas</h1>
+    <div class="sub">Elegí el modo de cálculo y corré el optimizador. El resultado queda guardado hasta el próximo cálculo.</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Modo de cálculo</h2></div>
+  <div class="card-body">
+    <form method="post" action="{% url 'rutas:api_ejecutar_calculo' %}" id="form-calcular">
+      {% csrf_token %}
+      <div class="radios">
+        {% for modo in modos_calculo %}
+          <label>
+            <input type="radio" name="modo_calculo" value="{{ modo }}" {% if modo == modo_calculo_actual %}checked{% endif %} class="radio-modo">
+            {{ modo }}
+          </label>
+        {% endfor %}
+      </div>
+
+      <div id="tabla-mixto" {% if modo_calculo_actual != "Mixto (elegir nivel por cantón)" %}hidden{% endif %}>
+        {% if cantones_disponibles %}
+          <div class="caption">Elegí, para cada cantón, si se calcula como una sola ruta o dividido por distrito:</div>
+          {% for canton in cantones_disponibles %}
+            <div class="fila-mixto">
+              <span>{{ canton }}</span>
+              <select name="nivel__{{ canton }}">
+                <option value="Cantón completo">Cantón completo</option>
+                <option value="Por distrito">Por distrito</option>
+              </select>
+            </div>
+          {% endfor %}
+        {% else %}
+          <div class="msg warning">No hay ningún punto con 'Cantón' completo — llenalo en la pestaña Puntos para poder usar el modo Mixto.</div>
+        {% endif %}
+      </div>
+
+      <button type="submit" class="btn primary" id="btn-calcular">▶ Calcular rutas óptimas</button>
+    </form>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll(".radio-modo").forEach(r => {
+  r.addEventListener("change", () => {
+    document.querySelectorAll(".radio-modo").forEach(r2 => {
+      if (r2.checked) document.getElementById("tabla-mixto").hidden = (r2.value !== "Mixto (elegir nivel por cantón)");
+    });
+  });
+});
+document.getElementById("form-calcular").addEventListener("submit", () => {
+  const btn = document.getElementById("btn-calcular");
+  btn.disabled = true;
+  btn.textContent = "Consultando OSRM y optimizando rutas...";
+});
+</script>
+
+{% if not resultado %}
+  <div class="msg info">
+    Todavía no hay rutas calculadas. Cargá puntos y camiones y presioná <b>Calcular rutas óptimas</b>.
+  </div>
+{% else %}
+
+  {% if resultado.uso_osrm %}
+    <div class="msg success">✓ Distancias reales por carretera (OSRM)</div>
+  {% else %}
+    <div class="msg warning">Usando línea recta. Motivo: {{ resultado.error_matriz }}</div>
+  {% endif %}
+  {% if resultado.errores_osrm %}
+    <div class="msg info">Tramos con línea recta por fallas puntuales: {{ resultado.errores_osrm|join:"; " }}</div>
+  {% endif %}
+
+  <div class="stats">
+    <div class="stat"><div class="eyebrow">Camiones usados</div><div class="val">{{ metricas.camiones_usados }}</div></div>
+    <div class="stat"><div class="eyebrow">Distancia total</div><div class="val">{{ metricas.dist_total_km|floatformat:1 }} <small>km</small></div></div>
+    <div class="stat"><div class="eyebrow">Peso total</div><div class="val">{{ metricas.peso_total|floatformat:0 }} <small>kg</small></div></div>
+    <div class="stat {% if camiones_excedidos %}warn{% endif %}"><div class="eyebrow">Fin estimado</div><div class="val">{{ metricas.hora_fin_max }}</div></div>
+  </div>
+
+  {% if camiones_excedidos %}
+    <div class="msg warning">
+      ⏱️ {{ camiones_excedidos|length }} camión(es) superan el tope de jornada configurado:
+      {% for c in camiones_excedidos %}{{ c.nombre }} ({{ c.horas_jornada|floatformat:1 }} h){% if not forloop.last %}; {% endif %}{% endfor %}.
+      La ruta se calculó igual — considerá quitarles puntos, sumar otro camión, o aceptarlo como excepción operativa.
+    </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-head"><h2>Frecuencia por ruta</h2></div>
+    <div class="card-body" style="padding-bottom:8px;">
+      <div class="caption" style="margin-top:0;">
+        Elegí los días de la semana en que pasa cada ruta. Con eso se estima el peso real de cada visita,
+        y podés filtrar el mapa de abajo por día.
+      </div>
+    </div>
+    <form method="post" action="{% url 'rutas:api_guardar_frecuencia' %}">
+      {% csrf_token %}
+      <div class="card-body flush">
+        {% for r in rutas_info %}
+          <input type="hidden" name="ruta__{{ r.idx }}" value="{{ r.nombre }}">
+          <div class="fila-ruta">
+            <strong>{{ r.nombre }}</strong>
+            <div class="dias-fila">
+              {% for d in r.dias %}
+                <label>{{ d.nombre|slice:":3" }}<input type="checkbox" name="dias__{{ r.idx }}" value="{{ d.nombre }}" {% if d.activo %}checked{% endif %}></label>
+              {% endfor %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="card-body" style="padding-top:12px;">
+        <button type="submit" class="btn">Guardar frecuencia</button>
+      </div>
+    </form>
+
+    {% if tabla_semana %}
+      <div class="card-body flush">
+        <div class="caption" style="padding:12px 18px 0;">Peso estimado por día de la semana (kg):</div>
+        <div class="tbl-wrap">
+          <table class="datos">
+            <tr><th>Ruta</th>{% for dia in dias_semana %}<th>{{ dia|slice:":3" }}</th>{% endfor %}</tr>
+            {% for fila in tabla_semana %}
+              <tr>
+                <td>{{ fila.ruta }}</td>
+                {% for celda in fila.celdas %}<td class="num">{{ celda.valor }}</td>{% endfor %}
+              </tr>
+            {% endfor %}
+          </table>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Mapa de rutas</h2>
+      <div id="filtro-dias" class="filtro-dias"></div>
+    </div>
+    <div id="rutas-selector"></div>
+    <div class="card-body flush">
+      <div id="mapa"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Detalle por camión</h2></div>
+    <div class="card-body flush" id="detalle-camiones" style="padding:14px 18px;"></div>
+  </div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+{% if resultado %}
+<style>
+  #detalle-camiones details.seccion { margin-bottom: 10px; }
+  #detalle-camiones details.seccion:last-child { margin-bottom: 0; }
+</style>
+<script>
+const resultado = {{ resultado_json|safe }};
+const rutasInfo = {{ rutas_info_json|safe }};
+const diasSemana = {{ dias_semana_json|safe }};
+const COLORES = ["#E74C3C", "#2980B9", "#27AE60", "#8E44AD", "#F39C12", "#16A085", "#D35400", "#7F8C8D"];
+
+// ── Días activos por ruta (nombre de camión → Set de días) ──
+const diasPorRuta = {};
+rutasInfo.forEach(r => {
+  diasPorRuta[r.nombre] = new Set(r.dias.filter(d => d.activo).map(d => d.nombre));
+});
+
+// ── Color por ruta ──
+const colorPorRuta = {};
+const etiquetasPorCamion = {};
+let colorI = 0;
+resultado.camiones.forEach(c => {
+  const etiquetas = [];
+  c.tramos.forEach(tramo => {
+    if (tramo.trip_idx >= c.n_viajes_usados) return;
+    colorPorRuta[`${c.nombre}||${tramo.trip_idx}`] = COLORES[colorI % COLORES.length];
+    etiquetas.push(tramo.etiqueta);
+    colorI++;
+  });
+  etiquetasPorCamion[c.nombre] = etiquetas;
+});
+const todasLasRutas = Object.values(etiquetasPorCamion).flat();
+
+// ── Selector de rutas ──
+const selectorDiv = document.getElementById("rutas-selector");
+todasLasRutas.forEach(etiqueta => {
+  const label = document.createElement("label");
+  const color = (() => {
+    for (const c of resultado.camiones) {
+      const tramo = c.tramos.find(t => t.etiqueta === etiqueta);
+      if (tramo) return colorPorRuta[`${c.nombre}||${tramo.trip_idx}`];
+    }
+    return "#999";
+  })();
+  label.innerHTML = `<input type="checkbox" class="chk-ruta" value="${etiqueta}" checked>
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};"></span> ${etiqueta}`;
+  selectorDiv.appendChild(label);
+});
+
+// ── Mapa ──
+const allLats = resultado.camiones.flatMap(c => c.camino.map(p => p[0]));
+const allLons = resultado.camiones.flatMap(c => c.camino.map(p => p[1]));
+const centro = [allLats.reduce((a, b) => a + b, 0) / allLats.length, allLons.reduce((a, b) => a + b, 0) / allLons.length];
+
+const map = L.map("mapa").setView(centro, 12);
+map.attributionControl.setPrefix(false);
+const capaOSM = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+const capaSatelite = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  {attribution: "Esri World Imagery"}
+);
+const capaClara = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {attribution: "&copy; CartoDB"});
+const capaOscura = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {attribution: "&copy; CartoDB"});
+L.control.layers({
+  "Mapa estándar": capaOSM, "Satélite": capaSatelite, "Claro": capaClara, "Oscuro": capaOscura,
+}, {}, {collapsed: true, position: "topright"}).addTo(map);
+
+const capasRuta = [];
+const capasAPlantel = [];
+const marcadoresParada = [];
+const marcadoresFijos = [];
+
+function iconoTexto(emoji, bg) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="background:${bg};color:white;border-radius:50%;width:28px;height:28px;
+           display:flex;align-items:center;justify-content:center;font-size:14px;
+           border:2px solid white;box-shadow:1px 1px 3px rgba(0,0,0,0.4);">${emoji}</div>`,
+    iconSize: [28, 28], iconAnchor: [14, 14],
+  });
+}
+
+const dibujadosGlobal = new Set();
+
+resultado.camiones.forEach(c => {
+  c.tramos.forEach(tramo => {
+    if (!tramo.camino || tramo.camino.length === 0) return;
+    if (tramo.trip_idx >= c.n_viajes_usados) {
+      const layer = L.polyline(tramo.camino, {color: "#6B7280", weight: 3, opacity: 0.7, dashArray: "6,8"})
+        .bindTooltip(`${c.nombre} · a plantel`).addTo(map);
+      capasAPlantel.push({camion: c.nombre, layer});
+    } else {
+      const color = colorPorRuta[`${c.nombre}||${tramo.trip_idx}`];
+      const layer = L.polyline(tramo.camino, {color, weight: 4, opacity: 0.85})
+        .bindTooltip(tramo.etiqueta).addTo(map);
+      capasRuta.push({etiqueta: tramo.etiqueta, layer});
+    }
+  });
+
+  c.resumen.forEach(fila => {
+    const clave = `${fila.lat.toFixed(6)},${fila.lon.toFixed(6)}`;
+    if (fila.tipo === "inicio" || fila.tipo === "fin_jornada") {
+      if (dibujadosGlobal.has(clave)) return;
+      dibujadosGlobal.add(clave);
+      const marker = L.marker([fila.lat, fila.lon], {icon: iconoTexto("🚩", "#6B7280")})
+        .bindTooltip(`Plantel ${c.nombre}`)
+        .bindPopup(`<b>Plantel — ${c.nombre}</b>`)
+        .addTo(map);
+      marcadoresFijos.push(marker);
+    } else if (fila.tipo === "descarga") {
+      if (dibujadosGlobal.has(clave)) return;
+      dibujadosGlobal.add(clave);
+      const marker = L.marker([fila.lat, fila.lon], {icon: iconoTexto("⬇", "#27AE60")})
+        .bindTooltip("DEPOT LLEGADA")
+        .bindPopup("<b>DEPOT LLEGADA — Descarga</b>")
+        .addTo(map);
+      marcadoresFijos.push(marker);
+    } else if (fila.tipo === "almuerzo") {
+      return;
+    } else {
+      const etiquetaFila = c.tramos[fila.trip_idx].etiqueta;
+      const color = colorPorRuta[`${c.nombre}||${fila.trip_idx}`];
+      const icon = L.divIcon({
+        className: "",
+        html: `<div style="background:${color};color:white;border-radius:50%;width:30px;height:30px;
+               display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:bold;
+               border:2px solid white;box-shadow:2px 2px 4px rgba(0,0,0,0.4);">${fila.orden}</div>`,
+        iconSize: [30, 30], iconAnchor: [15, 15],
+      });
+      const popup = `<div style="font-family:sans-serif;font-size:13px;line-height:1.6;min-width:170px;">
+        <div style="font-size:15px;font-weight:700;border-bottom:2px solid ${color};padding-bottom:4px;margin-bottom:6px;">${fila.Nombre}</div>
+        <div><b>Camión:</b> ${etiquetaFila}</div>
+        <div><b>Llegada:</b> ${fila["Hora llegada"]}</div>
+        <div><b>Peso:</b> ${fila["Peso recogido (kg)"]} kg</div>
+        </div>`;
+      const marker = L.marker([fila.lat, fila.lon], {icon})
+        .bindTooltip(`${etiquetaFila} · ${fila.orden}. ${fila.Nombre}`)
+        .bindPopup(popup)
+        .addTo(map);
+      marcadoresParada.push({etiqueta: etiquetaFila, layer: marker});
+    }
+  });
+});
+
+function actualizarVisibilidad() {
+  const seleccionadas = new Set(
+    Array.from(document.querySelectorAll(".chk-ruta:checked")).map(chk => chk.value)
+  );
+  capasRuta.forEach(cr => {
+    if (seleccionadas.has(cr.etiqueta)) { if (!map.hasLayer(cr.layer)) cr.layer.addTo(map); }
+    else if (map.hasLayer(cr.layer)) map.removeLayer(cr.layer);
+  });
+  marcadoresParada.forEach(mp => {
+    if (seleccionadas.has(mp.etiqueta)) { if (!map.hasLayer(mp.layer)) mp.layer.addTo(map); }
+    else if (map.hasLayer(mp.layer)) map.removeLayer(mp.layer);
+  });
+  capasAPlantel.forEach(ap => {
+    const visible = (etiquetasPorCamion[ap.camion] || []).some(et => seleccionadas.has(et));
+    if (visible) { if (!map.hasLayer(ap.layer)) ap.layer.addTo(map); }
+    else if (map.hasLayer(ap.layer)) map.removeLayer(ap.layer);
+  });
+}
+document.querySelectorAll(".chk-ruta").forEach(chk => chk.addEventListener("change", actualizarVisibilidad));
+
+// ── Detalle por camión ──
+const detalleDiv = document.getElementById("detalle-camiones");
+resultado.camiones.forEach((c) => {
+  const nParadas = c.resumen.filter(f => f.tipo === "parada").length;
+  const capacidadEfectiva = c.capacidad * c.n_viajes_usados;
+  const usoPct = capacidadEfectiva ? (c.peso_total / capacidadEfectiva * 100) : 0;
+  const viajesTxt = `${c.n_viajes_usados} viaje${c.n_viajes_usados !== 1 ? "s" : ""}`;
+
+  const filas = c.resumen.map(f => `
+    <tr>
+      <td>${f.Parada}</td>
+      <td>${f.Nombre}</td>
+      <td class="num">${f["Hora llegada"]}</td>
+      <td class="num">${Number(f["Peso recogido (kg)"]).toLocaleString("es-CR")}</td>
+      <td class="num">${Number(f["Peso acumulado (kg)"]).toLocaleString("es-CR")}</td>
+      <td class="num">${f["Distancia tramo (km)"]}</td>
+    </tr>`).join("");
+
+  const det = document.createElement("details");
+  det.className = "seccion";
+  det.dataset.camion = c.nombre;
+  det.open = (resultado.camiones.length === 1);
+  det.innerHTML = `
+    <summary>${c.nombre} &nbsp;|&nbsp; ${nParadas} paradas &nbsp;|&nbsp; ${viajesTxt} &nbsp;|&nbsp;
+      ${(c.dist_total_m / 1000).toFixed(1)} km &nbsp;|&nbsp; carga ${usoPct.toFixed(0)}%</summary>
+    <div class="detalle-metricas">
+      <div><div class="label">Paradas</div><div class="valor">${nParadas}</div></div>
+      <div><div class="label">Viajes usados</div><div class="valor">${c.n_viajes_usados} de ${c.viajes_max}</div></div>
+      <div><div class="label">Distancia total</div><div class="valor">${(c.dist_total_m / 1000).toFixed(1)} km</div></div>
+      <div><div class="label">Carga del día</div><div class="valor">${c.peso_total.toLocaleString("es-CR")} kg (${usoPct.toFixed(0)}%)</div></div>
+      <div><div class="label">Fin de jornada</div><div class="valor">${c.hora_fin}</div></div>
+    </div>
+    <div class="tbl-wrap">
+      <table class="datos">
+        <tr><th>Parada</th><th>Nombre</th><th>Hora llegada</th><th>Peso recogido (kg)</th><th>Peso acumulado (kg)</th><th>Distancia tramo (km)</th></tr>
+        ${filas}
+      </table>
+    </div>`;
+  detalleDiv.appendChild(det);
+});
+
+// ── Filtro por día ──
+const etiquetaACamion = {};
+Object.entries(etiquetasPorCamion).forEach(([nombre, etiquetas]) => {
+  etiquetas.forEach(et => { etiquetaACamion[et] = nombre; });
+});
+
+const filtroDiv = document.getElementById("filtro-dias");
+const opcionesDias = ["Todos", ...diasSemana];
+opcionesDias.forEach(dia => {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = dia === "Todos" ? "Todos" : dia.slice(0, 3);
+  btn.dataset.dia = dia;
+  if (dia === "Todos") btn.classList.add("on");
+  btn.addEventListener("click", () => aplicarFiltroDia(dia));
+  filtroDiv.appendChild(btn);
+});
+
+function aplicarFiltroDia(dia) {
+  filtroDiv.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.dia === dia));
+
+  const camionesVisibles = dia === "Todos"
+    ? new Set(resultado.camiones.map(c => c.nombre))
+    : new Set(resultado.camiones.filter(c => (diasPorRuta[c.nombre] || new Set()).has(dia)).map(c => c.nombre));
+
+  document.querySelectorAll(".chk-ruta").forEach(chk => {
+    const camion = etiquetaACamion[chk.value];
+    const visible = camionesVisibles.has(camion);
+    chk.checked = visible;
+    chk.closest("label").hidden = !visible;
+  });
+  actualizarVisibilidad();
+
+  detalleDiv.querySelectorAll("details").forEach(det => {
+    det.hidden = !camionesVisibles.has(det.dataset.camion);
+  });
+}
+
+// ── Pantalla completa ──
+function agregarControlPantallaCompleta(mapaLeaflet) {
+  const FullscreenControl = L.Control.extend({
+    options: {position: "topright"},
+    onAdd: function () {
+      const btn = L.DomUtil.create("button", "leaflet-bar leaflet-control leaflet-control-fullscreen");
+      btn.type = "button";
+      btn.title = "Pantalla completa";
+      btn.style.width = "30px";
+      btn.style.height = "30px";
+      const actualizarIcono = () => { btn.innerHTML = document.fullscreenElement ? "✕" : "⛶"; };
+      actualizarIcono();
+      L.DomEvent.on(btn, "click", (e) => {
+        L.DomEvent.stop(e);
+        const contenedor = mapaLeaflet.getContainer();
+        if (!document.fullscreenElement) contenedor.requestFullscreen();
+        else document.exitFullscreen();
+      });
+      document.addEventListener("fullscreenchange", () => {
+        actualizarIcono();
+        setTimeout(() => mapaLeaflet.invalidateSize(), 100);
+      });
+      L.DomEvent.disableClickPropagation(btn);
+      return btn;
+    },
+  });
+  mapaLeaflet.addControl(new FullscreenControl());
+}
+agregarControlPantallaCompleta(map);
+</script>
+{% endif %}
+{% endblock %}

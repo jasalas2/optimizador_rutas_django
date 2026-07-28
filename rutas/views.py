@@ -1,0 +1,1246 @@
+import io
+import json
+import time
+from datetime import datetime as dt
+
+import networkx as nx
+import pandas as pd
+from django.contrib import messages
+from django.core.exceptions import ValidationError
+from django.http import Http404, HttpResponse, JsonResponse
+from django.shortcuts import redirect, render
+from django.utils import timezone
+from django.views.decorators.http import require_POST
+
+from core.optimizador import (
+    DIAS_SEMANA,
+    TIPOS_VIA_DEFAULT,
+    bbox_de_camino,
+    calcular_rutas_para_puntos,
+    camino_geometria_red,
+    clasificar_tramos_ruta,
+    construir_grafo_red,
+    construir_indice_vias,
+    contar_componentes_red,
+    costo_diario_inversion,
+    costo_diario_recurrente,
+    descargar_red_osm_clasificada,
+    exportar_geojson,
+    exportar_gpx,
+    exportar_kml,
+    exportar_shapefile,
+    filtrar_camiones_para_grupo,
+    generar_links_google_maps,
+    geocodificar_direccion,
+    leer_capa_lineas,
+    matriz_distancias_red,
+    obtener_ruta_completa_osrm_por_leg,
+    peso_estimado_ruta_para_dia,
+    reconstruir_viajes_desde_resumen,
+    resolver_vrp,
+)
+from .models import (
+    Camion,
+    ConfiguracionGeneral,
+    CostoInversion,
+    CostoRecurrente,
+    CostosGenerales,
+    Punto,
+    RedPropiaGrafo,
+    RedPropiaPunto,
+    RedPropiaResultado,
+    ResultadoCalculo,
+    RutaFrecuencia,
+    TasaViaKgKm,
+    ViaResultado,
+)
+
+TIPO_VIA_COLOR = {
+    "motorway": "#E74C3C", "trunk": "#E67E22", "primary": "#F1C40F",
+    "secondary": "#27AE60", "tertiary": "#3498DB", "residential": "#8E44AD",
+    "otro": "#7F8C8D",
+}
+
+
+def _errores_de_instancia(instancia, etiqueta, exclude=None):
+    """Corre las validaciones del modelo (validators de campo, tipos, etc.)
+    sobre una instancia todavía no guardada. Devuelve una lista de mensajes
+    "etiqueta: campo — mensaje", vacía si todo está bien."""
+    try:
+        instancia.full_clean(exclude=exclude)
+    except ValidationError as e:
+        errores = []
+        for campo, mensajes in e.message_dict.items():
+            for m in mensajes:
+                errores.append(f"{etiqueta}: {campo} — {m}")
+        return errores
+    return []
+
+
+def _punto_to_row(p):
+    return {
+        "id": p.id,
+        "Nombre": p.nombre,
+        "Dirección": p.direccion,
+        "Latitud": p.latitud,
+        "Longitud": p.longitud,
+        "Peso (kg)": p.peso_kg,
+        "Camión": p.camion_asignado.nombre if p.camion_asignado_id else "Auto",
+        "Cantón": p.canton,
+        "Distrito": p.distrito,
+    }
+
+
+def _metricas_puntos(puntos_qs):
+    peso_total = sum(p.peso_kg or 0 for p in puntos_qs)
+    camiones = list(Camion.objects.all())
+    cap_flota_efectiva = sum((c.capacidad_kg or 0) * (c.viajes_max or 1) for c in camiones)
+    capacidad_max_flota = max((c.capacidad_kg or 0) for c in camiones) if camiones else 0
+
+    puntos_pesados = []
+    if camiones:
+        for p in puntos_qs:
+            if (p.peso_kg or 0) > capacidad_max_flota:
+                cabe_en = [c.nombre for c in camiones if (p.peso_kg or 0) <= c.capacidad_kg]
+                puntos_pesados.append({
+                    "Punto": p.nombre,
+                    "Peso (kg)": p.peso_kg,
+                    "Cabe en algún camión": ", ".join(cabe_en) if cabe_en else "Ninguno",
+                })
+
+    return {
+        "peso_total": peso_total,
+        "cap_flota_efectiva": cap_flota_efectiva,
+        "excede_capacidad": peso_total > cap_flota_efectiva,
+        "puntos_pesados": puntos_pesados,
+    }
+
+
+def puntos_view(request):
+    puntos = Punto.objects.select_related("camion_asignado").order_by("id")
+    nombres_camiones = list(Camion.objects.order_by("nombre").values_list("nombre", flat=True))
+    context = {
+        "puntos_json": json.dumps([_punto_to_row(p) for p in puntos]),
+        "camiones_json": json.dumps(["Auto"] + nombres_camiones),
+        "metricas_json": json.dumps(_metricas_puntos(puntos)),
+    }
+    return render(request, "rutas/puntos.html", context)
+
+
+def _guardar_filas(filas):
+    """Reemplaza todos los puntos por las filas recibidas (mismo comportamiento
+    que guardar_puntos() en Streamlit: borra todo y vuelve a insertar,
+    descartando filas sin Nombre). Valida todo ANTES de tocar la base — si
+    alguna fila tiene datos fuera de rango, no se guarda nada y se devuelven
+    los errores para que el usuario los corrija."""
+    camiones_por_nombre = {c.nombre: c for c in Camion.objects.all()}
+    nuevos = []
+    errores = []
+    for fila in filas:
+        nombre = (fila.get("Nombre") or "").strip()
+        if not nombre:
+            continue
+        camion_nombre = fila.get("Camión") or "Auto"
+        p = Punto(
+            nombre=nombre,
+            direccion=fila.get("Dirección") or "",
+            latitud=fila.get("Latitud"),
+            longitud=fila.get("Longitud"),
+            peso_kg=fila.get("Peso (kg)") or 0,
+            camion_asignado=camiones_por_nombre.get(camion_nombre),
+            canton=fila.get("Cantón") or "",
+            distrito=fila.get("Distrito") or "",
+        )
+        errores += _errores_de_instancia(p, nombre, exclude=["camion_asignado"])
+        nuevos.append(p)
+    if errores:
+        return errores
+    Punto.objects.all().delete()
+    Punto.objects.bulk_create(nuevos)
+    return []
+
+
+@require_POST
+def api_guardar_puntos(request):
+    filas = json.loads(request.body)["filas"]
+    errores = _guardar_filas(filas)
+    if errores:
+        return JsonResponse({"errores": errores}, status=400)
+    puntos = Punto.objects.select_related("camion_asignado").order_by("id")
+    return JsonResponse({
+        "filas": [_punto_to_row(p) for p in puntos],
+        "metricas": _metricas_puntos(puntos),
+    })
+
+
+@require_POST
+def api_geocodificar_puntos(request):
+    filas = json.loads(request.body)["filas"]
+    errores_guardado = _guardar_filas(filas)
+    if errores_guardado:
+        return JsonResponse({"errores": errores_guardado}, status=400)
+
+    pendientes = Punto.objects.filter(latitud__isnull=True) | Punto.objects.filter(longitud__isnull=True)
+    pendientes = pendientes.exclude(direccion="").distinct()
+
+    errores = []
+    for p in pendientes:
+        lat, lon, err = geocodificar_direccion(p.direccion)
+        if lat is not None:
+            p.latitud, p.longitud = lat, lon
+            p.save(update_fields=["latitud", "longitud"])
+        else:
+            errores.append(f"{p.direccion}: {err}")
+        time.sleep(1)
+
+    puntos = Punto.objects.select_related("camion_asignado").order_by("id")
+    return JsonResponse({
+        "filas": [_punto_to_row(p) for p in puntos],
+        "metricas": _metricas_puntos(puntos),
+        "errores": errores,
+    })
+
+
+def _camion_to_row(c):
+    return {
+        "id": c.id,
+        "Nombre": c.nombre,
+        "Capacidad (kg)": c.capacidad_kg,
+        "Personas": c.personas,
+        "Viajes máx.": c.viajes_max,
+        "Plantel Lat": c.plantel_lat,
+        "Plantel Lon": c.plantel_lon,
+        "Cantón asignado": c.canton_asignado,
+        "Distrito asignado": c.distrito_asignado,
+    }
+
+
+def _metricas_camiones(camiones_qs):
+    validos = [c for c in camiones_qs if c.nombre and c.capacidad_kg]
+    if not validos:
+        return None
+    cap_total = sum(c.capacidad_kg for c in validos)
+    personas_total = sum(c.personas or 1 for c in validos)
+    cap_total_viajes = sum(c.capacidad_kg * (c.viajes_max or 1) for c in validos)
+    return {
+        "cap_total": cap_total,
+        "personas_total": personas_total,
+        "cap_total_viajes": cap_total_viajes,
+    }
+
+
+def camiones_view(request):
+    camiones = Camion.objects.order_by("id")
+    context = {
+        "camiones_json": json.dumps([_camion_to_row(c) for c in camiones]),
+        "metricas_json": json.dumps(_metricas_camiones(camiones)),
+    }
+    return render(request, "rutas/camiones.html", context)
+
+
+def _guardar_filas_camiones(filas):
+    """Reemplaza todos los camiones por las filas recibidas — mismo
+    comportamiento que guardar_camiones() en Streamlit (borra todo, vuelve
+    a insertar, descartando filas sin Nombre). Los puntos que tenían un
+    camión asignado que ya no existe vuelven a "Auto" (SET_NULL). Valida
+    todo antes de tocar la base — ver _guardar_filas (Puntos)."""
+    nuevos = []
+    errores = []
+    for fila in filas:
+        nombre = (fila.get("Nombre") or "").strip()
+        if not nombre or fila.get("Capacidad (kg)") in (None, ""):
+            continue
+        c = Camion(
+            nombre=nombre,
+            capacidad_kg=fila.get("Capacidad (kg)") or 1000,
+            personas=fila.get("Personas") or 1,
+            viajes_max=fila.get("Viajes máx.") or 1,
+            plantel_lat=fila.get("Plantel Lat"),
+            plantel_lon=fila.get("Plantel Lon"),
+            canton_asignado=fila.get("Cantón asignado") or "",
+            distrito_asignado=fila.get("Distrito asignado") or "",
+        )
+        errores += _errores_de_instancia(c, nombre)
+        nuevos.append(c)
+    if errores:
+        return errores
+    Camion.objects.all().delete()
+    Camion.objects.bulk_create(nuevos)
+    return []
+
+
+@require_POST
+def api_guardar_camiones(request):
+    filas = json.loads(request.body)["filas"]
+    errores = _guardar_filas_camiones(filas)
+    if errores:
+        return JsonResponse({"errores": errores}, status=400)
+    camiones = Camion.objects.order_by("id")
+    return JsonResponse({
+        "filas": [_camion_to_row(c) for c in camiones],
+        "metricas": _metricas_camiones(camiones),
+    })
+
+
+def _parsear_hora(valor, default, etiqueta, warnings):
+    try:
+        return dt.strptime((valor or "").strip(), "%H:%M").time()
+    except ValueError:
+        warnings.append(f"{etiqueta}: formato inválido, usando {default.strftime('%H:%M')}.")
+        return default
+
+
+def _parsear_num(valor, default, tipo=float):
+    try:
+        return tipo(valor)
+    except (TypeError, ValueError):
+        return default
+
+
+def configuracion_view(request):
+    config = ConfiguracionGeneral.cargar()
+
+    if request.method == "POST":
+        warnings = []
+        config.hora_inicio = _parsear_hora(
+            request.POST.get("hora_inicio"), ConfiguracionGeneral._meta.get_field("hora_inicio").default,
+            "Hora de inicio", warnings)
+        config.velocidad_kmh = _parsear_num(request.POST.get("velocidad_kmh"), config.velocidad_kmh, int)
+        config.tiempo_parada = _parsear_num(request.POST.get("tiempo_parada"), config.tiempo_parada, int)
+        config.tiempo_descarga = _parsear_num(request.POST.get("tiempo_descarga"), config.tiempo_descarga, int)
+
+        config.usar_almuerzo = request.POST.get("usar_almuerzo") == "on"
+        if config.usar_almuerzo:
+            config.hora_almuerzo_inicio = _parsear_hora(
+                request.POST.get("hora_almuerzo_inicio"), ConfiguracionGeneral._meta.get_field("hora_almuerzo_inicio").default,
+                "Almuerzo — inicio", warnings)
+            config.hora_almuerzo_fin = _parsear_hora(
+                request.POST.get("hora_almuerzo_fin"), ConfiguracionGeneral._meta.get_field("hora_almuerzo_fin").default,
+                "Almuerzo — fin", warnings)
+            if config.hora_almuerzo_fin <= config.hora_almuerzo_inicio:
+                messages.error(request, "El fin del almuerzo debe ser después del inicio.")
+                return render(request, "rutas/configuracion.html", {"config": config})
+
+        config.tope_horas_jornada = _parsear_num(request.POST.get("tope_horas_jornada"), config.tope_horas_jornada)
+
+        config.velocidad_variable_via = request.POST.get("velocidad_variable_via") == "on"
+        if config.velocidad_variable_via:
+            config.velocidad_rapida_kmh = _parsear_num(request.POST.get("velocidad_rapida_kmh"), config.velocidad_rapida_kmh, int)
+
+        config.balancear = request.POST.get("balancear") == "on"
+
+        config.depot2_lat = _parsear_num(request.POST.get("depot2_lat"), config.depot2_lat)
+        config.depot2_lon = _parsear_num(request.POST.get("depot2_lon"), config.depot2_lon)
+
+        errores = _errores_de_instancia(config, "Configuración")
+        if errores:
+            for e in errores:
+                messages.error(request, e)
+            return render(request, "rutas/configuracion.html", {"config": config})
+
+        config.save()
+
+        for w in warnings:
+            messages.warning(request, w)
+        messages.success(request, "Guardada")
+        return redirect("rutas:configuracion")
+
+    return render(request, "rutas/configuracion.html", {"config": config})
+
+
+MODOS_CALCULO = [
+    "Todos los puntos juntos",
+    "Una ruta por Distrito",
+    "Una ruta por Cantón",
+    "Mixto (elegir nivel por cantón)",
+]
+
+
+def _puntos_dataframe():
+    cols = ["Nombre", "Latitud", "Longitud", "Peso (kg)", "Camión", "Cantón", "Distrito"]
+    filas = [{
+        "Nombre": p.nombre, "Latitud": p.latitud, "Longitud": p.longitud,
+        "Peso (kg)": p.peso_kg,
+        "Camión": p.camion_asignado.nombre if p.camion_asignado_id else "Auto",
+        "Cantón": p.canton, "Distrito": p.distrito,
+    } for p in Punto.objects.select_related("camion_asignado").all()]
+    return pd.DataFrame(filas, columns=cols)
+
+
+def _camiones_dataframe():
+    cols = ["Nombre", "Capacidad (kg)", "Personas", "Viajes máx.", "Plantel Lat",
+            "Plantel Lon", "Cantón asignado", "Distrito asignado"]
+    filas = [{
+        "Nombre": c.nombre, "Capacidad (kg)": c.capacidad_kg, "Personas": c.personas,
+        "Viajes máx.": c.viajes_max, "Plantel Lat": c.plantel_lat, "Plantel Lon": c.plantel_lon,
+        "Cantón asignado": c.canton_asignado, "Distrito asignado": c.distrito_asignado,
+    } for c in Camion.objects.all()]
+    return pd.DataFrame(filas, columns=cols)
+
+
+def _tabla_semana(resultado, rutas_frecuencia):
+    """Filas con claves simples (ascii, sin espacios) a propósito, para poder
+    iterarlas con notación de punto en el template Django."""
+    rutas_con_dias = [nom for nom, dias in rutas_frecuencia.items() if dias.strip()]
+    filas = []
+    for nom in rutas_con_dias:
+        c_ruta = next((c for c in resultado["camiones"] if c["nombre"] == nom), None)
+        if c_ruta is None:
+            continue
+        dias_ruta_str = rutas_frecuencia[nom]
+        dias_de_la_ruta = {d.strip() for d in dias_ruta_str.split(",") if d.strip()}
+        celdas = []
+        for dia in DIAS_SEMANA:
+            if dia in dias_de_la_ruta:
+                peso_dia = peso_estimado_ruta_para_dia(c_ruta["peso_total"], dias_ruta_str, dia)
+                valor = f"{peso_dia:,.0f} kg"
+            else:
+                valor = "-"
+            celdas.append({"dia": dia[:3], "valor": valor})
+        filas.append({"ruta": nom, "celdas": celdas})
+    return filas
+
+
+def calcular_view(request):
+    cantones_disponibles = sorted({
+        p.canton.strip() for p in Punto.objects.exclude(canton="") if p.canton.strip()
+    })
+
+    resultado_obj = ResultadoCalculo.cargar()
+    resultado = resultado_obj.resultado_json
+
+    rutas_frecuencia = {}
+    tabla_semana = []
+    if resultado:
+        nombres_rutas = [c["nombre"] for c in resultado["camiones"]]
+        frecuencias = {
+            rf.nombre_ruta: rf.dias
+            for rf in RutaFrecuencia.objects.filter(nombre_ruta__in=nombres_rutas)
+        }
+        rutas_frecuencia = {nom: frecuencias.get(nom, "") for nom in nombres_rutas}
+        tabla_semana = _tabla_semana(resultado, rutas_frecuencia)
+
+    metricas = None
+    camiones_excedidos = []
+    rutas_info = []
+    if resultado:
+        metricas = {
+            "camiones_usados": len(resultado["camiones"]),
+            "dist_total_km": sum(c["dist_total_m"] for c in resultado["camiones"]) / 1000,
+            "peso_total": sum(c["peso_total"] for c in resultado["camiones"]),
+            "hora_fin_max": max(c["hora_fin"] for c in resultado["camiones"]),
+        }
+        camiones_excedidos = [c for c in resultado["camiones"] if c.get("excede_jornada")]
+
+        for idx, c in enumerate(resultado["camiones"]):
+            dias_guardados = {d.strip() for d in rutas_frecuencia.get(c["nombre"], "").split(",") if d.strip()}
+            rutas_info.append({
+                "idx": idx,
+                "nombre": c["nombre"],
+                "dias": [{"nombre": dia, "activo": dia in dias_guardados} for dia in DIAS_SEMANA],
+            })
+
+    context = {
+        "modos_calculo": MODOS_CALCULO,
+        "modo_calculo_actual": resultado_obj.modo_calculo or "Todos los puntos juntos",
+        "cantones_disponibles": cantones_disponibles,
+        "resultado": resultado,
+        "resultado_json": json.dumps(resultado) if resultado else "null",
+        "rutas_info": rutas_info,
+        "rutas_info_json": json.dumps(rutas_info),
+        "dias_semana": DIAS_SEMANA,
+        "dias_semana_json": json.dumps(DIAS_SEMANA),
+        "tabla_semana": tabla_semana,
+        "metricas": metricas,
+        "camiones_excedidos": camiones_excedidos,
+    }
+    return render(request, "rutas/calcular.html", context)
+
+
+@require_POST
+def api_ejecutar_calculo(request):
+    config = ConfiguracionGeneral.cargar()
+    modo_calculo = request.POST.get("modo_calculo", "Todos los puntos juntos")
+
+    tabla = _puntos_dataframe()
+    tabla_camiones = _camiones_dataframe()
+
+    puntos_todos = tabla.dropna(subset=["Latitud", "Longitud"])
+    cams = tabla_camiones.dropna(subset=["Nombre", "Capacidad (kg)"])
+
+    if len(puntos_todos) < 1:
+        messages.error(request, "Necesitás al menos 1 punto con coordenadas.")
+        return redirect("rutas:calcular")
+    if len(cams) < 1:
+        messages.error(request, "Necesitás al menos 1 camión (pestaña Camiones).")
+        return redirect("rutas:calcular")
+
+    kwargs_comunes = dict(
+        depot2_lat=config.depot2_lat, depot2_lon=config.depot2_lon,
+        hora_inicio=config.hora_inicio, velocidad_kmh=config.velocidad_kmh,
+        tiempo_parada=config.tiempo_parada, balancear=config.balancear,
+        velocidad_variable_via=config.velocidad_variable_via,
+        velocidad_rapida_kmh=config.velocidad_rapida_kmh,
+        tiempo_descarga=config.tiempo_descarga,
+        hora_almuerzo_inicio=config.hora_almuerzo_inicio if config.usar_almuerzo else None,
+        hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
+        tope_horas_jornada=config.tope_horas_jornada,
+    )
+
+    if modo_calculo == "Todos los puntos juntos":
+        resultado, error = calcular_rutas_para_puntos(puntos_todos, cams, **kwargs_comunes)
+        if error:
+            messages.error(request, error)
+            return redirect("rutas:calcular")
+    else:
+        canton_de_distrito = {}
+        for _, fila_p in puntos_todos.dropna(subset=["Distrito"]).iterrows():
+            dist_val = str(fila_p["Distrito"]).strip()
+            cant_val = str(fila_p.get("Cantón", "") or "").strip()
+            if dist_val and cant_val and dist_val not in canton_de_distrito:
+                canton_de_distrito[dist_val] = cant_val
+
+        plan_grupos = []
+        if modo_calculo == "Mixto (elegir nivel por cantón)":
+            etiqueta_modo = "zona (mixto)"
+            cantones_disponibles = sorted(
+                v for v in puntos_todos["Cantón"].fillna("").unique() if str(v).strip() != ""
+            )
+            if not cantones_disponibles:
+                messages.error(request, "No hay cantones para el modo Mixto — llenalo en la pestaña Puntos.")
+                return redirect("rutas:calcular")
+            for canton_actual in cantones_disponibles:
+                nivel = request.POST.get(f"nivel__{canton_actual}", "Cantón completo")
+                if nivel == "Cantón completo":
+                    plan_grupos.append((canton_actual, "Cantón", canton_actual))
+                else:
+                    distritos_del_canton = sorted(
+                        v for v in puntos_todos.loc[
+                            puntos_todos["Cantón"] == canton_actual, "Distrito"
+                        ].fillna("").unique() if str(v).strip() != ""
+                    )
+                    for distrito_val in distritos_del_canton:
+                        plan_grupos.append((distrito_val, "Distrito", distrito_val))
+        else:
+            campo_grupo = "Cantón" if modo_calculo == "Una ruta por Cantón" else "Distrito"
+            etiqueta_modo = campo_grupo.lower()
+            valores = sorted(
+                v for v in puntos_todos[campo_grupo].fillna("").unique() if str(v).strip() != ""
+            )
+            for valor in valores:
+                plan_grupos.append((valor, campo_grupo, valor))
+
+        if not plan_grupos:
+            messages.error(
+                request,
+                f"No hay ningún punto con datos completos para agrupar por {etiqueta_modo} — "
+                "revisá Cantón/Distrito en la pestaña Puntos.",
+            )
+            return redirect("rutas:calcular")
+
+        resultados_grupos = {}
+        errores_grupos = []
+        for grupo_key, campo_grupo_local, valor in plan_grupos:
+            puntos_grupo = puntos_todos[puntos_todos[campo_grupo_local] == valor]
+            cams_grupo = filtrar_camiones_para_grupo(cams, campo_grupo_local, valor, canton_de_distrito)
+            if len(cams_grupo) < 1:
+                errores_grupos.append(
+                    f"{grupo_key}: ningún camión está asignado a este "
+                    f"{campo_grupo_local.lower()} (ni disponible como comodín) — "
+                    "revisá 'Cantón/Distrito asignado' en Camiones."
+                )
+                continue
+            resultado_grupo, error = calcular_rutas_para_puntos(puntos_grupo, cams_grupo, **kwargs_comunes)
+            if error:
+                errores_grupos.append(f"{grupo_key}: {error}")
+            else:
+                resultados_grupos[grupo_key] = resultado_grupo
+
+        if not resultados_grupos:
+            messages.error(
+                request,
+                f"No se pudo calcular ninguna ruta por {etiqueta_modo}. " + " | ".join(errores_grupos),
+            )
+            return redirect("rutas:calcular")
+
+        camiones_combinados = []
+        errores_osrm_combinados = []
+        for grupo_key, resultado_grupo in resultados_grupos.items():
+            for c in resultado_grupo["camiones"]:
+                c_zona = dict(c)
+                c_zona["nombre"] = f"{grupo_key} — {c['nombre']}"
+                camiones_combinados.append(c_zona)
+            for err in resultado_grupo["errores_osrm"]:
+                errores_osrm_combinados.append(f"[{grupo_key}] {err}")
+
+        resultado = {
+            "camiones": camiones_combinados,
+            "uso_osrm": all(rg["uso_osrm"] for rg in resultados_grupos.values()),
+            "error_matriz": None,
+            "errores_osrm": errores_osrm_combinados,
+            "hora_inicio": config.hora_inicio.strftime("%H:%M"),
+        }
+        if errores_grupos:
+            messages.warning(
+                request,
+                f"{len(errores_grupos)} de {len(plan_grupos)} no se pudieron calcular: "
+                + " | ".join(errores_grupos),
+            )
+
+    resultado_obj = ResultadoCalculo.cargar()
+    resultado_obj.resultado_json = resultado
+    resultado_obj.modo_calculo = modo_calculo
+    resultado_obj.calculado_en = timezone.now()
+    resultado_obj.save()
+
+    messages.success(request, f"Rutas calculadas para {len(resultado['camiones'])} camión(es).")
+    return redirect("rutas:calcular")
+
+
+@require_POST
+def api_guardar_frecuencia(request):
+    idx = 0
+    while f"ruta__{idx}" in request.POST:
+        ruta_nombre = request.POST[f"ruta__{idx}"]
+        dias_marcados = request.POST.getlist(f"dias__{idx}")
+        RutaFrecuencia.objects.update_or_create(
+            nombre_ruta=ruta_nombre, defaults={"dias": ",".join(dias_marcados)}
+        )
+        idx += 1
+    return redirect("rutas:calcular")
+
+
+def _inversion_to_row(c):
+    return {"id": c.id, "Concepto": c.concepto, "Monto total (CRC)": c.monto, "Vida útil (años)": c.vida_util_anios}
+
+
+def _recurrente_to_row(c):
+    return {"id": c.id, "Concepto": c.concepto, "Monto (CRC)": c.monto, "Frecuencia": c.frecuencia}
+
+
+def _inversion_dataframe():
+    cols = ["Monto total (CRC)", "Vida útil (años)"]
+    filas = [{"Monto total (CRC)": c.monto, "Vida útil (años)": c.vida_util_anios}
+             for c in CostoInversion.objects.all()]
+    return pd.DataFrame(filas, columns=cols)
+
+
+def _recurrente_dataframe(tipo):
+    cols = ["Monto (CRC)", "Frecuencia"]
+    filas = [{"Monto (CRC)": c.monto, "Frecuencia": c.frecuencia}
+             for c in CostoRecurrente.objects.filter(tipo=tipo)]
+    return pd.DataFrame(filas, columns=cols)
+
+
+def costos_view(request):
+    config = CostosGenerales.cargar()
+    resultado = ResultadoCalculo.cargar().resultado_json
+
+    costo_inversion_dia = costo_diario_inversion(_inversion_dataframe())
+    costo_mantenimiento_dia = costo_diario_recurrente(_recurrente_dataframe(CostoRecurrente.TIPO_MANTENIMIENTO))
+    costo_administrativa_dia = costo_diario_recurrente(_recurrente_dataframe(CostoRecurrente.TIPO_ADMINISTRATIVA))
+
+    toneladas_ruta = None
+    kg_extra_via_sumado = 0.0
+    if resultado:
+        toneladas_ruta = sum(c["peso_total"] for c in resultado["camiones"]) / 1000
+        via = ViaResultado.cargar()
+        if via.sumar_a_recoleccion and via.resultados_via_json:
+            kg_extra_via_sumado = sum(f["Kg extra estimados"] for f in via.resultados_via_json)
+            toneladas_ruta += kg_extra_via_sumado / 1000
+    ton_nuevo = toneladas_ruta if toneladas_ruta is not None else (config.ton_nuevo_manual or 0)
+
+    if not resultado:
+        costo_por_tonelada = costo_operativo = km_total = litros = 0.0
+        costo_combustible = costo_variable = costo_mano_obra = 0.0
+        personas_total = 0
+    else:
+        km_total = sum(c["dist_total_m"] for c in resultado["camiones"]) / 1000
+        personas_total = sum(c["personas"] for c in resultado["camiones"])
+        litros = km_total / config.rendimiento if config.rendimiento > 0 else 0
+        costo_combustible = litros * config.precio_litro
+        costo_variable = km_total * config.costo_km_extra
+        costo_mano_obra = config.horas_laboradas * config.precio_hora * personas_total
+        costo_operativo = (costo_combustible + costo_variable + costo_mano_obra
+                           + costo_inversion_dia + costo_mantenimiento_dia + costo_administrativa_dia)
+        costo_por_tonelada = costo_operativo / ton_nuevo if ton_nuevo > 0 else 0.0
+
+    ton_actual_neta = max(config.ton_actual - ton_nuevo, 0.0)
+    costo_modelo_actual = ton_actual_neta * config.precio_ton_actual
+    costo_modelo_nuevo = ton_nuevo * costo_por_tonelada
+    diferencia = costo_modelo_actual - costo_modelo_nuevo
+    diferencia_pct = (diferencia / costo_modelo_actual * 100) if costo_modelo_actual > 0 else None
+
+    desglose = [
+        {"concepto": "Combustible", "monto": costo_combustible, "detalle": f"{litros:.1f} L x CRC {config.precio_litro:,.2f}"},
+        {"concepto": "Variables por km", "monto": costo_variable, "detalle": f"{km_total:.1f} km x CRC {config.costo_km_extra:,.2f}"},
+        {"concepto": "Mano de obra", "monto": costo_mano_obra,
+         "detalle": f"{config.horas_laboradas:.2f} h x CRC {config.precio_hora:,.2f} x {personas_total} persona(s)"},
+        {"concepto": "Inversión (prorrateada)", "monto": costo_inversion_dia, "detalle": "Camiones, garaje, otros — por vida útil"},
+        {"concepto": "Mantenimiento (prorrateado)", "monto": costo_mantenimiento_dia, "detalle": "Lavado, extintores, etc. — por frecuencia"},
+        {"concepto": "Administrativa (prorrateada)", "monto": costo_administrativa_dia, "detalle": "Contabilidad, permisos, seguros — por frecuencia"},
+        {"concepto": "TOTAL operativo diario", "monto": costo_operativo, "detalle": ""},
+        {"concepto": "Costo por tonelada", "monto": costo_por_tonelada, "detalle": f"Sobre {ton_nuevo:.2f} ton del modelo nuevo"},
+    ]
+
+    context = {
+        "config": config,
+        "toneladas_ruta": toneladas_ruta,
+        "ton_nuevo": ton_nuevo,
+        "kg_extra_via_sumado": kg_extra_via_sumado,
+        "tiene_resultado": resultado is not None,
+        "inversion_json": json.dumps([_inversion_to_row(c) for c in CostoInversion.objects.all()]),
+        "mantenimiento_json": json.dumps([_recurrente_to_row(c) for c in CostoRecurrente.objects.filter(tipo=CostoRecurrente.TIPO_MANTENIMIENTO)]),
+        "administrativa_json": json.dumps([_recurrente_to_row(c) for c in CostoRecurrente.objects.filter(tipo=CostoRecurrente.TIPO_ADMINISTRATIVA)]),
+        "costo_inversion_dia": costo_inversion_dia,
+        "costo_mantenimiento_dia": costo_mantenimiento_dia,
+        "costo_administrativa_dia": costo_administrativa_dia,
+        "km_total": km_total,
+        "litros": litros,
+        "costo_combustible": costo_combustible,
+        "costo_variable": costo_variable,
+        "costo_mano_obra": costo_mano_obra,
+        "personas_total": personas_total,
+        "costo_operativo": costo_operativo,
+        "costo_por_tonelada": costo_por_tonelada,
+        "ton_actual_neta": ton_actual_neta,
+        "costo_modelo_actual": costo_modelo_actual,
+        "costo_modelo_nuevo": costo_modelo_nuevo,
+        "diferencia": diferencia,
+        "diferencia_pct": diferencia_pct,
+        "desglose": desglose,
+    }
+    return render(request, "rutas/costos.html", context)
+
+
+@require_POST
+def api_guardar_toneladas(request):
+    config = CostosGenerales.cargar()
+    config.ton_actual = _parsear_num(request.POST.get("ton_actual"), config.ton_actual)
+    config.precio_ton_actual = _parsear_num(request.POST.get("precio_actual"), config.precio_ton_actual)
+    config.ton_nuevo_manual = _parsear_num(request.POST.get("ton_nuevo"), config.ton_nuevo_manual)
+    errores = _errores_de_instancia(config, "Toneladas", exclude=[
+        "horas_laboradas", "precio_hora", "rendimiento", "precio_litro", "costo_km_extra"])
+    if errores:
+        for e in errores:
+            messages.error(request, e)
+        return redirect("rutas:costos")
+    config.save()
+    messages.success(request, "Toneladas guardadas.")
+    return redirect("rutas:costos")
+
+
+@require_POST
+def api_guardar_mano_obra(request):
+    config = CostosGenerales.cargar()
+    config.horas_laboradas = _parsear_num(request.POST.get("horas_laboradas"), config.horas_laboradas)
+    config.precio_hora = _parsear_num(request.POST.get("precio_hora"), config.precio_hora)
+    errores = _errores_de_instancia(config, "Mano de obra", exclude=[
+        "ton_actual", "precio_ton_actual", "ton_nuevo_manual", "rendimiento", "precio_litro", "costo_km_extra"])
+    if errores:
+        for e in errores:
+            messages.error(request, e)
+        return redirect("rutas:costos")
+    config.save()
+    messages.success(request, "Mano de obra guardada.")
+    return redirect("rutas:costos")
+
+
+@require_POST
+def api_guardar_combustible(request):
+    config = CostosGenerales.cargar()
+    config.rendimiento = _parsear_num(request.POST.get("rendimiento"), config.rendimiento)
+    config.precio_litro = _parsear_num(request.POST.get("precio_litro"), config.precio_litro)
+    config.costo_km_extra = _parsear_num(request.POST.get("costo_km_extra"), config.costo_km_extra)
+    errores = _errores_de_instancia(config, "Combustible", exclude=[
+        "ton_actual", "precio_ton_actual", "ton_nuevo_manual", "horas_laboradas", "precio_hora"])
+    if errores:
+        for e in errores:
+            messages.error(request, e)
+        return redirect("rutas:costos")
+    config.save()
+    messages.success(request, "Combustible guardado.")
+    return redirect("rutas:costos")
+
+
+@require_POST
+def api_guardar_inversion(request):
+    filas = json.loads(request.body)["filas"]
+    nuevos = []
+    errores = []
+    for fila in filas:
+        concepto = (fila.get("Concepto") or "").strip()
+        if not concepto:
+            continue
+        c = CostoInversion(
+            concepto=concepto,
+            monto=fila.get("Monto total (CRC)") or 0,
+            vida_util_anios=fila.get("Vida útil (años)") or 1,
+        )
+        errores += _errores_de_instancia(c, concepto)
+        nuevos.append(c)
+    if errores:
+        return JsonResponse({"errores": errores}, status=400)
+    CostoInversion.objects.all().delete()
+    CostoInversion.objects.bulk_create(nuevos)
+    costo_dia = costo_diario_inversion(_inversion_dataframe())
+    return JsonResponse({
+        "filas": [_inversion_to_row(c) for c in CostoInversion.objects.all()],
+        "costo_dia": costo_dia,
+    })
+
+
+@require_POST
+def api_guardar_recurrente(request, tipo):
+    if tipo not in (CostoRecurrente.TIPO_MANTENIMIENTO, CostoRecurrente.TIPO_ADMINISTRATIVA):
+        return JsonResponse({"error": "tipo inválido"}, status=400)
+    filas = json.loads(request.body)["filas"]
+    nuevos = []
+    errores = []
+    for fila in filas:
+        concepto = (fila.get("Concepto") or "").strip()
+        if not concepto:
+            continue
+        c = CostoRecurrente(
+            tipo=tipo,
+            concepto=concepto,
+            monto=fila.get("Monto (CRC)") or 0,
+            frecuencia=fila.get("Frecuencia") or "Mes",
+        )
+        errores += _errores_de_instancia(c, concepto)
+        nuevos.append(c)
+    if errores:
+        return JsonResponse({"errores": errores}, status=400)
+    CostoRecurrente.objects.filter(tipo=tipo).delete()
+    CostoRecurrente.objects.bulk_create(nuevos)
+    costo_dia = costo_diario_recurrente(_recurrente_dataframe(tipo))
+    return JsonResponse({
+        "filas": [_recurrente_to_row(c) for c in CostoRecurrente.objects.filter(tipo=tipo)],
+        "costo_dia": costo_dia,
+    })
+
+
+def _resultado_o_404():
+    resultado = ResultadoCalculo.cargar().resultado_json
+    if not resultado:
+        raise Http404("Todavía no hay rutas calculadas.")
+    return resultado
+
+
+def exportar_view(request):
+    resultado = ResultadoCalculo.cargar().resultado_json
+    rutas_google_maps = []
+    rutas_waze = []
+    if resultado:
+        for c in resultado["camiones"]:
+            stops = [(fila["lat"], fila["lon"]) for fila in c["resumen"]]
+            links = generar_links_google_maps(stops)
+            rutas_google_maps.append({"nombre": c["nombre"], "links": links})
+
+            paradas_waze = [
+                {
+                    "orden": fila["orden"], "nombre": fila["Nombre"], "hora": fila["Hora llegada"],
+                    "url": f"https://waze.com/ul?ll={fila['lat']},{fila['lon']}&navigate=yes",
+                }
+                for fila in c["resumen"] if fila["tipo"] == "parada"
+            ]
+            rutas_waze.append({"nombre": c["nombre"], "paradas": paradas_waze})
+
+    context = {
+        "tiene_resultado": resultado is not None,
+        "rutas_google_maps": rutas_google_maps,
+        "rutas_waze": rutas_waze,
+    }
+    return render(request, "rutas/exportar.html", context)
+
+
+def exportar_csv(request):
+    resultado = _resultado_o_404()
+    filas = []
+    for c in resultado["camiones"]:
+        for fila in c["resumen"]:
+            f2 = {"Camión": c["nombre"], **{k: v for k, v in fila.items() if k not in ("lat", "lon", "orden")}}
+            filas.append(f2)
+    csv_bytes = pd.DataFrame(filas).to_csv(index=False).encode("utf-8")
+    resp = HttpResponse(csv_bytes, content_type="text/csv")
+    resp["Content-Disposition"] = 'attachment; filename="rutas_optimas.csv"'
+    return resp
+
+
+def exportar_geojson_view(request):
+    resultado = _resultado_o_404()
+    resp = HttpResponse(exportar_geojson(resultado), content_type="application/geo+json")
+    resp["Content-Disposition"] = 'attachment; filename="rutas_optimas.geojson"'
+    return resp
+
+
+def exportar_shapefile_view(request):
+    resultado = _resultado_o_404()
+    resp = HttpResponse(exportar_shapefile(resultado), content_type="application/zip")
+    resp["Content-Disposition"] = 'attachment; filename="rutas_optimas_shp.zip"'
+    return resp
+
+
+def exportar_gpx_view(request):
+    resultado = _resultado_o_404()
+    resp = HttpResponse(exportar_gpx(resultado), content_type="application/gpx+xml")
+    resp["Content-Disposition"] = 'attachment; filename="rutas_optimas.gpx"'
+    return resp
+
+
+def exportar_kml_view(request):
+    resultado = _resultado_o_404()
+    resp = HttpResponse(exportar_kml(resultado), content_type="application/vnd.google-earth.kml+xml")
+    resp["Content-Disposition"] = 'attachment; filename="rutas_optimas.kml"'
+    return resp
+
+
+# ══════════════ Red propia (Beta) ══════════════
+# Sección 100% independiente: no lee ni escribe Puntos/Camiones/Resultados.
+
+class _ArchivoDjango(io.BytesIO):
+    """Envoltorio para que un UploadedFile de Django tenga la misma interfaz
+    que un UploadedFile de Streamlit (.name + .getbuffer()), que es lo que
+    espera leer_capa_lineas() en core/optimizador.py — sin tocar esa función."""
+    def __init__(self, uploaded_file):
+        super().__init__(uploaded_file.read())
+        self.name = uploaded_file.name
+
+
+def _grafo_desde_bd():
+    """Reconstruye el networkx.Graph guardado en RedPropiaGrafo (serializado
+    como nodos + aristas porque un Graph no es JSON-serializable)."""
+    info = RedPropiaGrafo.cargar()
+    if info.nodos_json is None:
+        return None, None, info
+    G = nx.Graph()
+    G.add_nodes_from(range(len(info.nodos_json)))
+    for a, b, peso in info.aristas_json:
+        G.add_edge(a, b, weight=peso)
+    nodos = [tuple(n) for n in info.nodos_json]
+    return G, nodos, info
+
+
+def _red_propia_punto_to_row(p):
+    return {"id": p.id, "Nombre": p.nombre, "Latitud": p.latitud, "Longitud": p.longitud}
+
+
+def red_propia_view(request):
+    G, nodos, info = _grafo_desde_bd()
+    puntos = RedPropiaPunto.objects.all()
+    resultado = RedPropiaResultado.cargar().resultado_json
+
+    context = {
+        "tiene_grafo": G is not None,
+        "info": info,
+        "puntos_json": json.dumps([_red_propia_punto_to_row(p) for p in puntos]),
+        "resultado": resultado,
+        "resultado_json": json.dumps(resultado) if resultado else "null",
+    }
+    return render(request, "rutas/red_propia.html", context)
+
+
+@require_POST
+def api_red_propia_cargar(request):
+    archivos = request.FILES.getlist("archivos")
+    tolerancia_m = float(request.POST.get("tolerancia_m") or 5.0)
+    if not archivos:
+        messages.error(request, "No se subió ningún archivo.")
+        return redirect("rutas:red_propia")
+
+    archivos_adaptados = [_ArchivoDjango(a) for a in archivos]
+    gdf_lineas, error_lectura = leer_capa_lineas(archivos_adaptados)
+    if error_lectura:
+        messages.error(request, error_lectura)
+        return redirect("rutas:red_propia")
+
+    G, nodos = construir_grafo_red(gdf_lineas, tolerancia_m=tolerancia_m)
+    componentes = contar_componentes_red(G)
+
+    info = RedPropiaGrafo.cargar()
+    info.nodos_json = [list(n) for n in nodos]
+    info.aristas_json = [[a, b, d["weight"]] for a, b, d in G.edges(data=True)]
+    info.n_lineas = len(gdf_lineas)
+    info.n_componentes = len(componentes)
+    info.tamano_componentes_json = sorted((len(c) for c in componentes), reverse=True)
+    info.save()
+
+    RedPropiaResultado.cargar().resultado_json = None
+    RedPropiaResultado.cargar().save()
+
+    messages.success(request, "Red cargada.")
+    return redirect("rutas:red_propia")
+
+
+@require_POST
+def api_red_propia_guardar_puntos(request):
+    filas = json.loads(request.body)["filas"]
+    nuevos = []
+    errores = []
+    for idx, fila in enumerate(filas):
+        nombre = (fila.get("Nombre") or "").strip()
+        if not nombre:
+            continue
+        p = RedPropiaPunto(
+            orden=idx, nombre=nombre,
+            latitud=fila.get("Latitud"), longitud=fila.get("Longitud"),
+        )
+        errores += _errores_de_instancia(p, nombre)
+        nuevos.append(p)
+    if errores:
+        return JsonResponse({"errores": errores}, status=400)
+    RedPropiaPunto.objects.all().delete()
+    RedPropiaPunto.objects.bulk_create(nuevos)
+    return JsonResponse({"filas": [_red_propia_punto_to_row(p) for p in RedPropiaPunto.objects.all()]})
+
+
+@require_POST
+def api_red_propia_calcular(request):
+    G, nodos, info = _grafo_desde_bd()
+    if G is None:
+        messages.error(request, "Cargá una red primero.")
+        return redirect("rutas:red_propia")
+
+    puntos_validos = list(RedPropiaPunto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True))
+    if len(puntos_validos) < 2:
+        messages.error(request, "Necesitás al menos 2 puntos con coordenadas.")
+        return redirect("rutas:red_propia")
+
+    puntos_lonlat = [(p.longitud, p.latitud) for p in puntos_validos]
+    nombres_red = [p.nombre for p in puntos_validos]
+
+    matriz, nodos_enganchados, enganches, pares_sin_red = matriz_distancias_red(puntos_lonlat, G, nodos)
+    # matriz_distancias_red da distancias float (Dijkstra sobre la red); resolver_vrp
+    # (OR-Tools) necesita costos de arco enteros, igual que la matriz de OSRM que usa
+    # normalmente -- se redondea acá nada más, sin tocar la lógica de core/.
+    matriz_int = [[int(round(v)) for v in fila] for fila in matriz]
+    demandas_red = [0] * len(puntos_lonlat)
+    rutas_red = resolver_vrp(matriz_int, demandas_red, [10**9], start_nodes=[0], end_node=0)
+
+    if rutas_red is None or not rutas_red[0]:
+        messages.error(request, "No se pudo calcular una ruta con estos puntos.")
+        return redirect("rutas:red_propia")
+
+    orden_nodos = rutas_red[0][0]
+    camino_completo = []
+    dist_total_m = 0.0
+    for a, b in zip(orden_nodos, orden_nodos[1:]):
+        tramo = camino_geometria_red(G, nodos, nodos_enganchados[a], nodos_enganchados[b])
+        camino_completo.extend(tramo if not camino_completo else tramo[1:])
+        dist_total_m += matriz[a][b]
+
+    distancias_enganche = [enganches[i][1] for i in range(len(enganches))]
+
+    resultado = {
+        "orden_nodos": orden_nodos,
+        "nombres": [nombres_red[i] for i in orden_nodos],
+        "puntos_lonlat": puntos_lonlat,
+        "camino": camino_completo,
+        "dist_total_m": dist_total_m,
+        "pares_sin_red": [[nombres_red[i], nombres_red[j]] for i, j in pares_sin_red],
+        "distancias_enganche": distancias_enganche,
+        "nombres_todos": nombres_red,
+    }
+    resultado_obj = RedPropiaResultado.cargar()
+    resultado_obj.resultado_json = resultado
+    resultado_obj.save()
+
+    messages.success(request, "Ruta calculada.")
+    return redirect("rutas:red_propia")
+
+
+# ══════════════ Recolección en vía (Beta) ══════════════
+# Análisis de SOLO LECTURA sobre las rutas ya calculadas en Calcular/Resultados.
+# No modifica ResultadoCalculo, ni pesos, ni capacidades, ni costos del
+# sistema principal — solo estima un total aparte de "kg extra" según el tipo
+# de vía OSM que atraviesa cada ruta.
+
+TASAS_VIA_DEFAULT = {
+    "motorway": 5.0, "trunk": 4.0, "primary": 3.0, "secondary": 2.0,
+    "tertiary": 1.0, "residential": 0.5, "otro": 0.2,
+}
+
+
+def _json_safe(value):
+    """clasificar_tramos_ruta() devuelve edge_id como numpy.int64 (via
+    shapely STRtree.nearest) -- no es serializable a JSON de forma nativa.
+    Convierte recursivamente cualquier escalar tipo numpy a su equivalente
+    Python antes de guardar en un JSONField."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        return value.item()
+    return value
+
+
+def _tasas_via_seed():
+    if not TasaViaKgKm.objects.exists():
+        TasaViaKgKm.objects.bulk_create([
+            TasaViaKgKm(tipo=t, kg_extra_por_km=v) for t, v in TASAS_VIA_DEFAULT.items()
+        ])
+    orden = {t: i for i, t in enumerate(TIPOS_VIA_DEFAULT)}
+    return sorted(TasaViaKgKm.objects.all(), key=lambda t: orden.get(t.tipo, 99))
+
+
+def recoleccion_via_view(request):
+    resultado = ResultadoCalculo.cargar().resultado_json
+    tasas = _tasas_via_seed()
+    via = ViaResultado.cargar()
+
+    context = {
+        "tiene_resultado": resultado is not None,
+        "tiene_via_resultado": bool(via.resultados_via_json),
+        "tasas": tasas,
+        "sumar_a_recoleccion": via.sumar_a_recoleccion,
+        "resultados_via_json": json.dumps(via.resultados_via_json) if via.resultados_via_json else "null",
+        "tramos_mapa_json": json.dumps(via.tramos_mapa_json) if via.tramos_mapa_json else "null",
+        "detalle_progresivo_json": json.dumps(via.detalle_progresivo_json) if via.detalle_progresivo_json else "null",
+        "tipo_via_color_json": json.dumps(TIPO_VIA_COLOR),
+        "tipos_via_default_json": json.dumps(TIPOS_VIA_DEFAULT),
+    }
+    if via.resultados_via_json:
+        total_kg_extra = sum(f["Kg extra estimados"] for f in via.resultados_via_json)
+        total_km_real = sum(f["Km ruta real (Resultados)"] for f in via.resultados_via_json)
+        total_km_dedup = sum(f["Km clasificados (dedup)"] for f in via.resultados_via_json)
+        total_km_sin_dedup = sum(f["Km clasificados (sin dedup)"] for f in via.resultados_via_json)
+        context.update({
+            "total_kg_extra": total_kg_extra,
+            "total_km_real": total_km_real,
+            "total_km_dedup": total_km_dedup,
+            "total_km_sin_dedup": total_km_sin_dedup,
+            "muy_por_debajo": total_km_real > 0 and total_km_dedup < total_km_real * 0.5,
+        })
+    return render(request, "rutas/recoleccion_via.html", context)
+
+
+@require_POST
+def api_recoleccion_via_calcular(request):
+    resultado = ResultadoCalculo.cargar().resultado_json
+    if not resultado:
+        messages.error(request, "Calculá las rutas primero en la pestaña Calcular. "
+                                 "Esta sección analiza esas rutas, no genera las suyas propias.")
+        return redirect("rutas:recoleccion_via")
+
+    tasas_rows = _tasas_via_seed()
+    tasas = {}
+    errores_tasas = []
+    for t in tasas_rows:
+        valor = request.POST.get(f"tasa__{t.tipo}")
+        t.kg_extra_por_km = _parsear_num(valor, t.kg_extra_por_km)
+        errores_tasas += _errores_de_instancia(t, t.tipo)
+        tasas[t.tipo] = t.kg_extra_por_km
+    if errores_tasas:
+        for e in errores_tasas:
+            messages.error(request, e)
+        return redirect("rutas:recoleccion_via")
+    TasaViaKgKm.objects.bulk_update(tasas_rows, ["kg_extra_por_km"])
+
+    sumar_a_recoleccion = request.POST.get("sumar_a_recoleccion") == "on"
+
+    caminos_todos = [p for c in resultado["camiones"] for p in c["camino"]]
+    try:
+        bbox = bbox_de_camino(caminos_todos)
+        gdf_vias = descargar_red_osm_clasificada(bbox)
+        arbol, tipos_via = construir_indice_vias(gdf_vias)
+    except Exception as e:
+        messages.error(request, f"No se pudo descargar la red vial de OpenStreetMap "
+                                 f"(revisá la conexión a internet): {e}")
+        return redirect("rutas:recoleccion_via")
+
+    resultados_via = []
+    tramos_via_mapa = []
+    edges_ya_contadas = set()
+
+    for c in resultado["camiones"]:
+        if not c["camino"]:
+            continue
+        tramos_clasificados = clasificar_tramos_ruta(c["camino"], arbol, tipos_via)
+
+        dist_por_via = {}
+        tipo_por_via = {}
+        for tramo in tramos_clasificados:
+            eid = tramo["edge_id"]
+            dist_por_via[eid] = dist_por_via.get(eid, 0.0) + tramo["dist_m"]
+            tipo_por_via[eid] = tramo["tipo"]
+
+        distancias = {t: 0.0 for t in TIPOS_VIA_DEFAULT}
+        dist_sin_dedup_m = sum(dist_por_via.values())
+        edges_contadas_este_camion = set()
+        for eid, dist_via in dist_por_via.items():
+            if eid in edges_ya_contadas:
+                continue
+            edges_ya_contadas.add(eid)
+            edges_contadas_este_camion.add(eid)
+            distancias[tipo_por_via[eid]] += dist_via
+
+        for tramo in tramos_clasificados:
+            contado = tramo["edge_id"] in edges_contadas_este_camion
+            tramos_via_mapa.append({**tramo, "camion": c["nombre"], "contado": contado})
+
+        km_total_dedup = sum(distancias.values()) / 1000
+        kg_extra_camion = sum((dist_m / 1000) * tasas.get(tipo, 0.0) for tipo, dist_m in distancias.items())
+        fila = {
+            "Camion": c["nombre"],
+            "Km ruta real (Resultados)": round(c["dist_total_m"] / 1000, 2),
+            "Km clasificados (dedup)": round(km_total_dedup, 2),
+            "Km clasificados (sin dedup)": round(dist_sin_dedup_m / 1000, 2),
+            "Kg extra estimados": round(kg_extra_camion, 2),
+        }
+        for tipo in TIPOS_VIA_DEFAULT:
+            fila[f"km en {tipo}"] = round(distancias.get(tipo, 0.0) / 1000, 2)
+        resultados_via.append(fila)
+
+    detalle_progresivo = None
+    if sumar_a_recoleccion:
+        detalle_progresivo = {}
+        edges_prog_contadas = set()
+        for c in resultado["camiones"]:
+            if not c["camino"]:
+                continue
+            viajes_stops = reconstruir_viajes_desde_resumen(c["resumen"])
+            filas_no_inicio = [f for f in c["resumen"] if f["tipo"] in ("parada", "descarga")]
+            fila_inicio = next(f for f in c["resumen"] if f["tipo"] == "inicio")
+
+            filas_detalle = [{
+                "Orden": fila_inicio["orden"], "Nombre": fila_inicio["Nombre"],
+                "Peso puntos acum. (kg)": "0.00", "Kg extra via (tramo)": "0.00",
+                "Peso TOTAL acumulado (kg)": "0.00",
+            }]
+            idx_fila, kg_via_acum = 0, 0.0
+            for stops in viajes_stops:
+                try:
+                    _, _, camino_por_leg_prog, _ = obtener_ruta_completa_osrm_por_leg(stops)
+                except Exception:
+                    camino_por_leg_prog = [[] for _ in range(len(stops) - 1)]
+                for leg_geom in camino_por_leg_prog:
+                    fila_actual = filas_no_inicio[idx_fila]
+                    idx_fila += 1
+                    kg_leg = 0.0
+                    if arbol is not None and leg_geom:
+                        for tramo in clasificar_tramos_ruta(leg_geom, arbol, tipos_via):
+                            eid = tramo["edge_id"]
+                            if eid in edges_prog_contadas:
+                                continue
+                            edges_prog_contadas.add(eid)
+                            kg_leg += (tramo["dist_m"] / 1000) * tasas.get(tramo["tipo"], 0.0)
+                    kg_via_acum += kg_leg
+                    peso_puntos = fila_actual["Peso acumulado (kg)"]
+                    filas_detalle.append({
+                        "Orden": fila_actual["orden"], "Nombre": fila_actual["Nombre"],
+                        "Peso puntos acum. (kg)": f"{peso_puntos:,.2f}",
+                        "Kg extra via (tramo)": f"{kg_leg:,.2f}",
+                        "Peso TOTAL acumulado (kg)": f"{peso_puntos + kg_via_acum:,.2f}",
+                    })
+            detalle_progresivo[c["nombre"]] = filas_detalle
+
+    via = ViaResultado.cargar()
+    via.resultados_via_json = _json_safe(resultados_via)
+    via.tramos_mapa_json = _json_safe(tramos_via_mapa)
+    via.sumar_a_recoleccion = sumar_a_recoleccion
+    via.detalle_progresivo_json = _json_safe(detalle_progresivo)
+    via.save()
+
+    messages.success(request, "Kg extra por tipo de vía calculado.")
+    return redirect("rutas:recoleccion_via")

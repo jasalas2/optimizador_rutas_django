@@ -1,0 +1,118 @@
+{% extends "rutas/_base.html" %}
+{% load static %}
+{% block title %}Camiones — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link href="https://unpkg.com/tabulator-tables@6.3/dist/css/tabulator.min.css" rel="stylesheet">
+<script src="https://unpkg.com/tabulator-tables@6.3/dist/js/tabulator.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Flota de camiones</h1>
+    <div class="sub">
+      <b>Plantel</b> es de dónde sale y a dónde vuelve ese camión cada día — obligatorio y propio de
+      cada uno. <b>Viajes máx.</b> es cuántas veces puede volver a salir tras descargar, en el mismo
+      día. <b>Cantón/Distrito asignado</b>: vacío = disponible en cualquier cálculo por zona.
+    </div>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="btn-agregar-fila">+ Agregar fila</button>
+    <label class="btn btn-archivo" for="input-csv">Importar CSV
+      <input type="file" id="input-csv" accept=".csv">
+    </label>
+  </div>
+</div>
+
+<div class="stats" id="metricas"></div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Tabla de camiones</h2>
+    <div class="btn-row">
+      <button class="btn primary" id="btn-guardar">Guardar camiones</button>
+      <span id="estado"></span>
+    </div>
+  </div>
+  <div class="card-body flush">
+    <div id="tabla-camiones"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let datosIniciales = {{ camiones_json|safe }};
+let metricasIniciales = {{ metricas_json|safe }};
+
+const table = new Tabulator("#tabla-camiones", {
+  data: datosIniciales,
+  layout: "fitColumns",
+  addRowPos: "bottom",
+  columns: [
+    {title: "Nombre", field: "Nombre", editor: "input", widthGrow: 2},
+    {title: "Capacidad (kg)", field: "Capacidad (kg)", editor: "number", editorParams: {min: 1}},
+    {title: "Personas", field: "Personas", editor: "number", editorParams: {min: 1, step: 1}},
+    {title: "Viajes máx.", field: "Viajes máx.", editor: "number", editorParams: {min: 1, step: 1}},
+    {title: "Plantel Lat", field: "Plantel Lat", editor: "number", editorParams: {step: 0.000001}},
+    {title: "Plantel Lon", field: "Plantel Lon", editor: "number", editorParams: {step: 0.000001}},
+    {title: "Cantón asignado", field: "Cantón asignado", editor: "input"},
+    {title: "Distrito asignado", field: "Distrito asignado", editor: "input"},
+    columnaBorrar(),
+  ],
+});
+
+table.on("tableBuilt", () => table.addRow({}));
+document.getElementById("btn-agregar-fila").addEventListener("click", () => table.addRow({}));
+
+function pintarMetricas(m) {
+  const cont = document.getElementById("metricas");
+  if (!m) { cont.innerHTML = ""; return; }
+  cont.innerHTML = `
+    <div class="stat">
+      <div class="eyebrow">Capacidad total de la flota</div>
+      <div class="val">${m.cap_total.toLocaleString("es-CR", {maximumFractionDigits: 0})} <small>kg</small></div>
+    </div>
+    <div class="stat">
+      <div class="eyebrow">Personas totales</div>
+      <div class="val">${m.personas_total}</div>
+    </div>
+    <div class="stat">
+      <div class="eyebrow">Capacidad considerando viajes</div>
+      <div class="val">${m.cap_total_viajes.toLocaleString("es-CR", {maximumFractionDigits: 0})} <small>kg</small></div>
+    </div>
+  `;
+}
+pintarMetricas(metricasIniciales);
+
+function filasNoVacias() {
+  return table.getData().filter(f => (f["Nombre"] || "").trim() !== "");
+}
+
+const aliasCamiones = {
+  nombre: "Nombre", capacidad: "Capacidad (kg)", capacidadkg: "Capacidad (kg)",
+  personas: "Personas", viajes: "Viajes máx.", viajesmax: "Viajes máx.",
+  plantellat: "Plantel Lat", lat: "Plantel Lat",
+  plantellon: "Plantel Lon", lon: "Plantel Lon",
+  cantonasignado: "Cantón asignado", distritoasignado: "Distrito asignado",
+};
+importarCSV("input-csv", ["Capacidad (kg)", "Personas", "Viajes máx.", "Plantel Lat", "Plantel Lon"], aliasCamiones, (nuevasFilas) => {
+  table.addData(nuevasFilas);
+  document.getElementById("estado").textContent = `${nuevasFilas.length} fila(s) importadas — revisá y guardá.`;
+});
+
+document.getElementById("btn-guardar").addEventListener("click", async () => {
+  const estado = document.getElementById("estado");
+  estado.textContent = "Guardando...";
+  try {
+    const data = await postJSON("{% url 'rutas:api_guardar_camiones' %}", {filas: filasNoVacias()});
+    table.setData(data.filas);
+    table.addRow({});
+    pintarMetricas(data.metricas);
+    estado.textContent = "Camiones guardados (recargá para ver los nombres en la tabla de puntos)";
+  } catch (e) {
+    estado.textContent = "No se guardó: " + e.message;
+  }
+});
+</script>
+{% endblock %}

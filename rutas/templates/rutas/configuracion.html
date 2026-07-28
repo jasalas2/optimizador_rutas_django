@@ -1,0 +1,106 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Configuración — Optimizador de Rutas{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Configuración</h1>
+    <div class="sub">Parámetros generales del cálculo — hora de salida, velocidad, tiempos de parada/descarga, almuerzo y tope de jornada.</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post" style="max-width:520px;">
+      {% csrf_token %}
+
+      <label for="hora_inicio">Hora de inicio (HH:MM)</label>
+      <input type="text" id="hora_inicio" name="hora_inicio" value="{{ config.hora_inicio|time:'H:i' }}">
+
+      <label for="velocidad_kmh">Velocidad promedio (km/h)</label>
+      <input type="number" id="velocidad_kmh" name="velocidad_kmh" min="10" max="120" value="{{ config.velocidad_kmh }}">
+
+      <label for="tiempo_parada">Tiempo por parada (min)</label>
+      <input type="number" id="tiempo_parada" name="tiempo_parada" min="1" max="60" value="{{ config.tiempo_parada }}">
+
+      <label for="tiempo_descarga">Tiempo de descarga en el depot (min)</label>
+      <input type="number" id="tiempo_descarga" name="tiempo_descarga" min="1" max="120" value="{{ config.tiempo_descarga }}">
+      <div class="help">Tiempo que tarda cada descarga al llegar al depósito de llegada — más largo que una
+        parada normal de recolección. Se suma cada vez que un camión llega a descargar, incluyendo cada
+        vuelta si tiene viajes múltiples.</div>
+
+      <div class="check">
+        <input type="checkbox" id="usar_almuerzo" name="usar_almuerzo" {% if config.usar_almuerzo %}checked{% endif %}>
+        <label for="usar_almuerzo">Insertar 1 hora de almuerzo en la planificación</label>
+      </div>
+      <div class="help">Se inserta una sola vez por camión/día, de hora fija de reloj, la primera vez que la
+        ruta sigue en curso al llegar esa hora.</div>
+      <div id="campos-almuerzo" style="margin-left:1.2rem;border-left:2px solid var(--border);padding-left:1rem;" {% if not config.usar_almuerzo %}hidden{% endif %}>
+        <div class="fila-2">
+          <div>
+            <label for="hora_almuerzo_inicio">Inicio (HH:MM)</label>
+            <input type="text" id="hora_almuerzo_inicio" name="hora_almuerzo_inicio" value="{{ config.hora_almuerzo_inicio|time:'H:i' }}">
+          </div>
+          <div>
+            <label for="hora_almuerzo_fin">Fin (HH:MM)</label>
+            <input type="text" id="hora_almuerzo_fin" name="hora_almuerzo_fin" value="{{ config.hora_almuerzo_fin|time:'H:i' }}">
+          </div>
+        </div>
+      </div>
+
+      <label for="tope_horas_jornada">Máximo de horas por ruta</label>
+      <input type="number" id="tope_horas_jornada" name="tope_horas_jornada" min="1" max="24" step="0.5" value="{{ config.tope_horas_jornada }}">
+      <div class="help">No bloquea el cálculo: si un camión termina por encima de este tope, la ruta se
+        genera igual y se marca con una alerta en Resultados, para que decidas cómo ajustarla.</div>
+
+      <div class="check">
+        <input type="checkbox" id="velocidad_variable_via" name="velocidad_variable_via" {% if config.velocidad_variable_via %}checked{% endif %}>
+        <label for="velocidad_variable_via">Velocidad más rápida en autopista/vía troncal</label>
+      </div>
+      <div class="help">Si está activo, los tramos clasificados como autopista o vía troncal (OpenStreetMap)
+        usan una velocidad más alta que el resto — más realista, pero necesita internet y hace el cálculo un
+        poco más lento.</div>
+      <div id="campos-via" style="margin-left:1.2rem;border-left:2px solid var(--border);padding-left:1rem;" {% if not config.velocidad_variable_via %}hidden{% endif %}>
+        <label for="velocidad_rapida_kmh">Velocidad en autopista/troncal (km/h)</label>
+        <input type="number" id="velocidad_rapida_kmh" name="velocidad_rapida_kmh" min="10" max="150" value="{{ config.velocidad_rapida_kmh }}">
+      </div>
+
+      <div class="check">
+        <input type="checkbox" id="balancear" name="balancear" {% if config.balancear %}checked{% endif %}>
+        <label for="balancear">Balancear rutas entre camiones</label>
+      </div>
+      <div class="help">Si está activo, reparte las paradas entre todos los camiones aunque el peso quepa en
+        uno solo. Si está inactivo, usa la menor cantidad de camiones posible (menor distancia total).</div>
+
+      <hr class="div">
+      <h2 style="font-size:14px;">Planta San Antonio</h2>
+      <div class="caption">Punto único donde TODOS los camiones descargan. La salida de cada camión se
+        configura por separado, en Camiones.</div>
+
+      <div class="fila-2">
+        <div>
+          <label for="depot2_lat">Latitud</label>
+          <input type="number" id="depot2_lat" name="depot2_lat" step="0.000001" value="{{ config.depot2_lat }}">
+        </div>
+        <div>
+          <label for="depot2_lon">Longitud</label>
+          <input type="number" id="depot2_lon" name="depot2_lon" step="0.000001" value="{{ config.depot2_lon }}">
+        </div>
+      </div>
+
+      <button type="submit" class="btn primary" style="margin-top:1.5rem;width:100%;">Guardar configuración</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById("usar_almuerzo").addEventListener("change", (e) => {
+  document.getElementById("campos-almuerzo").hidden = !e.target.checked;
+});
+document.getElementById("velocidad_variable_via").addEventListener("change", (e) => {
+  document.getElementById("campos-via").hidden = !e.target.checked;
+});
+</script>
+{% endblock %}
