@@ -9,8 +9,11 @@
   })();
 </script>
 <title>{% block title %}Optimizador de Rutas{% endblock %}</title>
-<link rel="stylesheet" href="{% static 'rutas/style.css' %}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 {% block extra_head %}{% endblock %}
+<link rel="stylesheet" href="{% static 'rutas/style.css' %}">
 </head>
 <body>
 <div class="shell">
@@ -29,6 +32,7 @@
     <div class="rail-group">
       <div class="eyebrow">Operación</div>
       <a class="rail-link {% if request.resolver_match.url_name == 'calcular' %}activa{% endif %}" href="{% url 'rutas:calcular' %}"><span class="ic">▶</span> Calcular</a>
+      <a class="rail-link {% if request.resolver_match.url_name == 'resultados' %}activa{% endif %}" href="{% url 'rutas:resultados' %}"><span class="ic">▤</span> Resultados</a>
       <a class="rail-link {% if request.resolver_match.url_name == 'costos' %}activa{% endif %}" href="{% url 'rutas:costos' %}"><span class="ic">₡</span> Costos</a>
       <a class="rail-link {% if request.resolver_match.url_name == 'exportar' %}activa{% endif %}" href="{% url 'rutas:exportar' %}"><span class="ic">↓</span> Exportar</a>
     </div>

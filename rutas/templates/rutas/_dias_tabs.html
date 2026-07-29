@@ -1,0 +1,11 @@
+<div class="dias-tabs">
+  {% for t in dias_tabs %}
+    <a class="dia-tab {% if t.dia == dia_actual %}activo{% endif %}" href="?{% if t.dia %}dia={{ t.dia }}{% endif %}">
+      <span>{{ t.etiqueta }}</span>
+      <span class="estado {% if t.calculado %}ok{% else %}pend{% endif %}">{% if t.calculado %}✓{% else %}—{% endif %}</span>
+    </a>
+  {% endfor %}
+</div>
+<div class="hint" style="font-size:11.5px;color:var(--text-faint);margin-top:10px;">
+  ✓ = ya tiene un resultado guardado para ese día · — = todavía no se calculó
+</div>

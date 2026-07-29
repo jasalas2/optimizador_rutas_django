@@ -53,23 +53,38 @@ class Camion(models.Model):
         return self.nombre
 
 
+class CamionDisponibilidad(models.Model):
+    """Días de la semana en que un camión (identificado por NOMBRE, igual
+    que RutaFrecuencia identifica rutas) puede usarse al calcular. Modelo
+    aparte —no un campo en Camion— para no perderse cuando se vuelve a
+    guardar la tabla de Camiones (que borra y recrea todas las filas)."""
+    nombre_camion = models.CharField(max_length=200, unique=True)
+    dias = models.CharField(max_length=200, blank=True, default="")
+
+    def __str__(self):
+        return self.nombre_camion
+
+
 class ResultadoCalculo(models.Model):
-    """Fila única (singleton, siempre pk=1) — guarda el último resultado de
-    calcular_rutas_para_puntos() (o la combinación de varios, si el modo de
-    cálculo fue por zona), para no tener que recalcular al entrar a la
-    pantalla de Resultados. Reemplaza st.session_state.resultados."""
+    """Guarda el último resultado de calcular_rutas_para_puntos() (o la
+    combinación de varios, si el modo de cálculo fue por zona), para no
+    tener que recalcular al entrar a la pantalla de Resultados. Reemplaza
+    st.session_state.resultados.
+
+    Una fila por día de la semana (`dia` en DIAS_SEMANA) más una fila con
+    dia="" para el cálculo "Todos" (sin filtrar la flota por disponibilidad
+    — es el comportamiento original, de antes de que existiera el filtro
+    por día), así conviven varios cálculos guardados a la vez en vez de
+    pisarse entre sí."""
+    dia = models.CharField(max_length=20, blank=True, default="", unique=True)
     resultado_json = models.JSONField(null=True, blank=True)
     modo_calculo = models.CharField(max_length=100, blank=True, default="")
     calculado_en = models.DateTimeField(null=True, blank=True)
 
     @classmethod
-    def cargar(cls):
-        obj, _ = cls.objects.get_or_create(pk=1)
+    def cargar(cls, dia=""):
+        obj, _ = cls.objects.get_or_create(dia=dia)
         return obj
-
-    def save(self, *args, **kwargs):
-        self.pk = 1
-        super().save(*args, **kwargs)
 
 
 class RutaFrecuencia(models.Model):

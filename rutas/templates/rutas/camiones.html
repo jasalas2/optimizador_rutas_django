@@ -38,6 +38,42 @@
     <div id="tabla-camiones"></div>
   </div>
 </div>
+
+<div class="card">
+  <div class="card-head"><h2>Días disponibles</h2></div>
+  <div class="card-body" style="padding-bottom:8px;">
+    <div class="caption" style="margin-top:0;">
+      Marcá en qué días de la semana puede usarse cada camión al calcular. Un camión sin ningún
+      día marcado está disponible TODOS los días (comportamiento por defecto). Se usa en
+      Calcular al elegir "¿para qué día calculás?".
+    </div>
+  </div>
+  {% if camiones_info %}
+    <form method="post" action="{% url 'rutas:api_guardar_disponibilidad_camiones' %}">
+      {% csrf_token %}
+      <div class="card-body flush">
+        {% for c in camiones_info %}
+          <input type="hidden" name="camion__{{ c.idx }}" value="{{ c.nombre }}">
+          <div class="fila-ruta">
+            <strong>{{ c.nombre }}</strong>
+            <div class="dias-fila">
+              {% for d in c.dias %}
+                <label>{{ d.nombre|slice:":3" }}<input type="checkbox" name="dias__{{ c.idx }}" value="{{ d.nombre }}" {% if d.activo %}checked{% endif %}></label>
+              {% endfor %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="card-body" style="padding-top:12px;">
+        <button type="submit" class="btn">Guardar disponibilidad</button>
+      </div>
+    </form>
+  {% else %}
+    <div class="card-body" style="padding-top:0;">
+      <div class="msg info">Guardá al menos un camión con nombre en la tabla de arriba para poder marcar su disponibilidad.</div>
+    </div>
+  {% endif %}
+</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -49,6 +85,7 @@ const table = new Tabulator("#tabla-camiones", {
   data: datosIniciales,
   layout: "fitColumns",
   addRowPos: "bottom",
+  nestedFieldSeparator: false,
   columns: [
     {title: "Nombre", field: "Nombre", editor: "input", widthGrow: 2},
     {title: "Capacidad (kg)", field: "Capacidad (kg)", editor: "number", editorParams: {min: 1}},

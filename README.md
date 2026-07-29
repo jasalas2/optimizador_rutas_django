@@ -33,7 +33,8 @@ contra lo que cuesta el modelo de recolección actual.
 | **Puntos** | Carga de paradas: nombre, dirección, coordenadas, peso (generación DIARIA, kg/día), cantón, distrito, camión asignado (opcional). Geocodifica direcciones, importa CSV, avisa si algún punto pesa más de lo que cualquier camión puede levantar en un solo viaje. |
 | **Camiones** | Flota: capacidad, personas, viajes máximos por día, plantel (obligatorio), y Cantón/Distrito asignado (opcional, para restringir en qué zonas puede trabajar). |
 | **Configuración** | Hora de inicio, velocidad, tiempos de parada/descarga, almuerzo, tope de jornada, planta de descarga. |
-| **Calcular** | Modo de cálculo (todos los puntos juntos / por Distrito / por Cantón / mixto), mapa con selector de rutas y filtro por día de la semana, alerta si algún camión excede el tope de jornada, y "Frecuencia por ruta". |
+| **Calcular** | Selector de día ("¿Para qué día calculás?"), camiones disponibles ese día, y modo de cálculo (todos los puntos juntos / por Distrito / por Cantón / mixto). Cada día guarda su propio resultado — se puede armar Lunes con una flota y Martes con otra sin que se pisen. |
+| **Resultados** | Mapa con selector de rutas, "Frecuencia por ruta", detalle por camión, y alerta si algún camión excede el tope de jornada. Tiene su propio selector de día para repasar cualquier cálculo ya guardado sin recalcular. |
 | **Costos** | Comparación modelo actual vs. modelo nuevo; estructura completa de costos; costo real por tonelada calculado automáticamente. |
 | **Exportar** | CSV, GeoJSON, Shapefile, GPX, KML, y links directos a Google Maps y Waze. |
 | **Red propia** *(Beta)* | Rutea sobre un shapefile de calles propio en vez de la red pública de OpenStreetMap. |
@@ -56,6 +57,24 @@ por semana) se asigna **después de calcular**, a la ruta ya armada:
 Las asignaciones de días quedan guardadas en base de datos (`RutaFrecuencia`),
 a diferencia de la v8 en Streamlit donde se perdían al reiniciar el servidor.
 
+Cuando el cálculo es para un **día específico** (no "Todos") y una ruta ya
+tiene frecuencia multi-día guardada, el sistema no se limita a mostrar el
+peso acumulado — **vuelve a resolver ese camión** con el peso real de ese
+día y tantos viajes como hagan falta para cubrirlo (el VRP no puede partir
+el peso de un mismo punto entre dos viajes, así que un punto que por sí
+solo supera la capacidad se parte en "copias" en la misma ubicación, para
+simular la vuelta real del camión).
+
+## Camiones disponibles por día
+
+Cada camión puede tener días de la semana específicos en los que trabaja
+(pestaña Camiones → "Días disponibles"). Sin ningún día marcado, el camión
+está disponible todos los días (comportamiento por defecto). Al calcular
+para un día puntual, la flota se filtra automáticamente por esa
+disponibilidad, y el resultado de ese día queda guardado aparte —
+`ResultadoCalculo` tiene una fila por día de la semana, más una para
+"Todos" (el cálculo único de toda la semana, comportamiento original).
+
 ## Estructura del proyecto
 
 ```
@@ -64,10 +83,12 @@ core/optimizador.py    # lógica de cálculo pura (VRP, modelo de tiempo,
                         # Django ni de UI, con pruebas propias
 core/tests/             # test_modelo_tiempo.py: escenarios del modelo de
                         # tiempo (almuerzo, tope de jornada, frecuencia)
-rutas/models.py         # Punto, Camion, ConfiguracionGeneral, Costos*,
-                        # ResultadoCalculo, RutaFrecuencia, Red propia, etc.
+rutas/models.py         # Punto, Camion, CamionDisponibilidad, ConfiguracionGeneral,
+                        # Costos*, ResultadoCalculo, RutaFrecuencia, Red propia, etc.
 rutas/views.py          # una vista por página + endpoints de guardado/cálculo
-rutas/templates/rutas/  # una plantilla por página, todas heredan de _base.html
+rutas/templates/rutas/  # una plantilla por página (Calcular y Resultados separadas),
+                        # todas heredan de _base.html; _dias_tabs.html es el selector
+                        # de día compartido entre Calcular y Resultados
 rutas/static/rutas/     # style.css (sistema de diseño) y app.js (helpers compartidos)
 ```
 
@@ -88,6 +109,49 @@ Antes de tocar `core/optimizador.py`, correr las pruebas:
 ```bash
 python -m pytest core/tests/test_modelo_tiempo.py -q
 ```
+
+## Actualización — 2026-07-28
+
+**Cálculo por día de la semana, con flota propia y recálculo real de acumulados**
+- Nueva página **Resultados**, separada de **Calcular** — antes todo vivía en
+  una sola pantalla (modo de cálculo, mapa, detalle por camión, frecuencia
+  por ruta) y quedaba saturada.
+- Camiones ahora pueden tener días de la semana específicos en los que
+  trabajan (`CamionDisponibilidad`). Calcular filtra la flota según el día
+  elegido y guarda un resultado por día (`ResultadoCalculo.dia`) — Lunes y
+  Martes pueden tener flotas y resultados distintos sin pisarse.
+- Cuando una ruta con frecuencia multi-día (ej. pasa cada 4 días) se calcula
+  para un día específico, el sistema ya no se queda con el peso diario
+  base: **vuelve a resolver ese camión con el peso real acumulado**,
+  abriendo tantos viajes como hagan falta — incluso partiendo el peso de un
+  mismo punto en "copias" cuando por sí solo supera la capacidad de un
+  viaje (el VRP no soporta entregas parciales de un punto entre dos viajes).
+- Nueva fila **"Sale vacío"** en el detalle por camión, con la hora real en
+  que termina la descarga (usa el tiempo de descarga configurado) y sale
+  rumbo al siguiente viaje o de vuelta al plantel.
+- El depot de llegada ahora se muestra como **"Planta San Antonio"** en vez
+  de "DEPOT LLEGADA".
+
+**Correcciones**
+- El almuerzo ahora respeta siempre la **duración completa** configurada
+  (antes, si el camión llegaba tarde dentro de la ventana, el descanso
+  podía durar solo unos minutos en vez de la hora completa).
+- El almuerzo también se revisa en el tramo final de regreso al plantel —
+  antes, si el mediodía caía justo ahí, se saltaba por completo.
+- Arreglada la columna **"Viajes máx."** en Camiones, que se guardaba bien
+  en la base de datos pero se mostraba vacía en la tabla (Tabulator
+  interpretaba el punto final del nombre de columna como un separador de
+  campo anidado).
+- El filtro de frecuencia por día (dentro de "Mapa de rutas") ya no se
+  puede aplicar dos veces sobre un resultado que ya es específico de un
+  día — antes eso inflaba el peso mostrado (ej. 200% de carga en vez del
+  87% real).
+
+**Diseño**
+- Tipografía Inter, bordes más redondeados, modo oscuro más profundo
+  (inspirado en guildstats.eu) manteniendo el modo claro como default.
+- Tablas con encabezados en negrita, divisores de columna más visibles, y
+  tipografía más grande en general.
 
 ## Pendientes
 

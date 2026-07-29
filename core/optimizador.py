@@ -401,6 +401,44 @@ def generar_links_google_maps(locations_in_order):
     return links
 
 
+def verificar_almuerzo(hora_actual, almuerzo_tomado,
+                       hora_almuerzo_inicio, hora_almuerzo_fin):
+    """
+    Revisa si corresponde insertar el almuerzo en este punto del reloj y,
+    si corresponde, avanza hora_actual hasta el fin del almuerzo. Devuelve
+    (hora_actual_nueva, almuerzo_tomado, fila_almuerzo_o_None).
+
+    - hora_almuerzo_inicio / hora_almuerzo_fin definen la VENTANA en la que
+      puede arrancar el almuerzo y su DURACIÓN (fin - inicio) — no una hora
+      de reloj a la que hay que volver. Se inserta UNA sola vez por
+      camión/día, la primera vez que el reloj llega o pasa la hora de
+      inicio de la ventana estando la ruta en curso, y siempre dura la
+      duración completa configurada desde ese momento (llegue el camión
+      justo al inicio de la ventana, a la mitad, o ya tarde y pasado el
+      cierre — nunca se acorta ni se salta el descanso).
+    - Si hora_almuerzo_inicio es None, el almuerzo está desactivado y
+      nunca se inserta (reproduce el comportamiento de antes).
+    - Se llama tanto después de cada parada/descarga como después del
+      tramo final de regreso al plantel, para que un mediodía que cae
+      DURANTE ese último tramo (y no justo en una parada) tampoco se
+      salte el almuerzo.
+    """
+    fila_almuerzo = None
+    if (not almuerzo_tomado) and (hora_almuerzo_inicio is not None) \
+            and hora_actual.time() >= hora_almuerzo_inicio:
+        duracion_almuerzo = (
+            datetime.combine(datetime.today(), hora_almuerzo_fin)
+            - datetime.combine(datetime.today(), hora_almuerzo_inicio)
+        )
+        inicio_almuerzo = hora_actual
+        fin_almuerzo = hora_actual + duracion_almuerzo
+        hora_actual = fin_almuerzo
+        almuerzo_tomado = True
+        fila_almuerzo = {"inicio": inicio_almuerzo, "fin": fin_almuerzo}
+
+    return hora_actual, almuerzo_tomado, fila_almuerzo
+
+
 def avanzar_reloj_tras_parada(hora_actual, es_descarga, tiempo_parada_min,
                               tiempo_descarga_min, almuerzo_tomado,
                               hora_almuerzo_inicio, hora_almuerzo_fin):
@@ -412,36 +450,13 @@ def avanzar_reloj_tras_parada(hora_actual, es_descarga, tiempo_parada_min,
     - Descarga en el depot usa tiempo_descarga_min (ej. 30 min), más largo
       que una parada normal (tiempo_parada_min), en vez de reutilizar el
       mismo valor para ambas cosas.
-    - El almuerzo es de hora fija de reloj (hora_almuerzo_inicio a
-      hora_almuerzo_fin): se inserta UNA sola vez por camión/día, la
-      primera vez que el reloj llega o pasa la hora de inicio del
-      almuerzo estando la ruta en curso. Si el camión ya venía con
-      retraso y llega después de la hora de fin, igual toma la hora
-      completa de almuerzo en ese momento (no se salta el descanso).
-    - Si hora_almuerzo_inicio es None, el almuerzo está desactivado y
-      nunca se inserta (reproduce el comportamiento de antes).
+    - La revisión del almuerzo la hace verificar_almuerzo().
     """
     hora_actual = hora_actual + timedelta(
         minutes=(tiempo_descarga_min if es_descarga else tiempo_parada_min)
     )
-
-    fila_almuerzo = None
-    if (not almuerzo_tomado) and (hora_almuerzo_inicio is not None) \
-            and hora_actual.time() >= hora_almuerzo_inicio:
-        inicio_almuerzo = hora_actual
-        fin_almuerzo = datetime.combine(hora_actual.date(), hora_almuerzo_fin)
-        if fin_almuerzo <= hora_actual:
-            # Ya pasó toda la ventana de almuerzo (ej. llegó a las 13:30) —
-            # de todos modos toma la hora completa de descanso desde ahora.
-            fin_almuerzo = hora_actual + (
-                datetime.combine(datetime.today(), hora_almuerzo_fin)
-                - datetime.combine(datetime.today(), hora_almuerzo_inicio)
-            )
-        hora_actual = fin_almuerzo
-        almuerzo_tomado = True
-        fila_almuerzo = {"inicio": inicio_almuerzo, "fin": fin_almuerzo}
-
-    return hora_actual, almuerzo_tomado, fila_almuerzo
+    return verificar_almuerzo(hora_actual, almuerzo_tomado,
+                              hora_almuerzo_inicio, hora_almuerzo_fin)
 
 
 def filtrar_camiones_para_grupo(cams, campo_grupo, valor, canton_de_distrito):
@@ -537,7 +552,7 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
     NOMBRES = (
         [f"PLANTEL — {NOMBRES_CAM[i]}" for i in range(n_camiones_flota)]
         + puntos["Nombre"].tolist()
-        + ["DEPOT LLEGADA"]
+        + ["Planta San Antonio"]
     )
     PESOS = [0] * n_camiones_flota + puntos["Peso (kg)"].fillna(0).tolist() + [0]
 
@@ -675,6 +690,21 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
                         "Distancia tramo (km)": f"{dist_m / 1000:.2f}",
                     })
                     orden_counter += 1
+                    if es_fin_viaje:
+                        # Fila informativa: cuándo termina de descargar (usa
+                        # tiempo_descarga, ej. 30 min) y sale vacío rumbo al
+                        # siguiente viaje o de regreso al plantel.
+                        hora_sale_vacio = hora_actual + timedelta(minutes=tiempo_descarga)
+                        resumen.append({
+                            "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "sale_vacio",
+                            "trip_idx": trip_idx,
+                            "Parada": f"Sale vacío ({tiempo_descarga:.0f} min descarga)",
+                            "Nombre": NOMBRES[node],
+                            "Hora llegada": hora_sale_vacio.strftime("%H:%M"),
+                            "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+                            "Distancia tramo (km)": "-",
+                        })
+                        orden_counter += 1
                     hora_actual, almuerzo_tomado, fila_almuerzo = avanzar_reloj_tras_parada(
                         hora_actual, es_fin_viaje, tiempo_parada, tiempo_descarga,
                         almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin,
@@ -713,6 +743,23 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
             else:
                 horas_plantel = (dist_plantel_m / 1000) / velocidad_kmh
             hora_actual += timedelta(hours=horas_plantel)
+
+        # Si el mediodía cae durante este último tramo (y no en una parada
+        # anterior), el almuerzo no se salta: se registra acá.
+        hora_actual, almuerzo_tomado, fila_almuerzo = verificar_almuerzo(
+            hora_actual, almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin
+        )
+        if fila_almuerzo is not None:
+            resumen.append({
+                "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
+                "tipo": "almuerzo", "trip_idx": len(viajes_nodos),
+                "Parada": "Almuerzo", "Nombre": "—",
+                "Hora llegada": fila_almuerzo["inicio"].strftime("%H:%M"),
+                "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+                "Distancia tramo (km)": "-",
+            })
+            orden_counter += 1
+
         resumen.append({
             "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
             "tipo": "fin_jornada", "trip_idx": len(viajes_nodos),

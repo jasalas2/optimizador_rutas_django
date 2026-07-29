@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import time
 from datetime import datetime as dt
 
@@ -9,6 +10,7 @@ from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
@@ -25,6 +27,7 @@ from core.optimizador import (
     costo_diario_inversion,
     costo_diario_recurrente,
     descargar_red_osm_clasificada,
+    dias_desde_ultima_recoleccion,
     exportar_geojson,
     exportar_gpx,
     exportar_kml,
@@ -41,6 +44,7 @@ from core.optimizador import (
 )
 from .models import (
     Camion,
+    CamionDisponibilidad,
     ConfiguracionGeneral,
     CostoInversion,
     CostoRecurrente,
@@ -231,11 +235,42 @@ def _metricas_camiones(camiones_qs):
 
 def camiones_view(request):
     camiones = Camion.objects.order_by("id")
+
+    nombres_camiones = [c.nombre for c in camiones if c.nombre]
+    disponibilidad = {
+        cd.nombre_camion: cd.dias
+        for cd in CamionDisponibilidad.objects.filter(nombre_camion__in=nombres_camiones)
+    }
+    camiones_info = []
+    for idx, nombre in enumerate(nombres_camiones):
+        dias_guardados = {d.strip() for d in disponibilidad.get(nombre, "").split(",") if d.strip()}
+        camiones_info.append({
+            "idx": idx,
+            "nombre": nombre,
+            "dias": [{"nombre": dia, "activo": dia in dias_guardados} for dia in DIAS_SEMANA],
+        })
+
     context = {
         "camiones_json": json.dumps([_camion_to_row(c) for c in camiones]),
         "metricas_json": json.dumps(_metricas_camiones(camiones)),
+        "camiones_info": camiones_info,
+        "dias_semana": DIAS_SEMANA,
     }
     return render(request, "rutas/camiones.html", context)
+
+
+@require_POST
+def api_guardar_disponibilidad_camiones(request):
+    idx = 0
+    while f"camion__{idx}" in request.POST:
+        camion_nombre = request.POST[f"camion__{idx}"]
+        dias_marcados = request.POST.getlist(f"dias__{idx}")
+        CamionDisponibilidad.objects.update_or_create(
+            nombre_camion=camion_nombre, defaults={"dias": ",".join(dias_marcados)}
+        )
+        idx += 1
+    messages.success(request, "Disponibilidad guardada.")
+    return redirect("rutas:camiones")
 
 
 def _guardar_filas_camiones(filas):
@@ -367,14 +402,31 @@ def _puntos_dataframe():
     return pd.DataFrame(filas, columns=cols)
 
 
-def _camiones_dataframe():
+def _camiones_disponibles_ese_dia(dia):
+    """Nombres de camión EXCLUIDOS de un día dado — los que tienen
+    disponibilidad configurada (CamionDisponibilidad) y ese día no está
+    entre los suyos. Un camión sin fila de disponibilidad (o con "dias"
+    vacío) está disponible todos los días — comportamiento por defecto,
+    para no afectar a nadie que no use este filtro."""
+    if not dia:
+        return set()
+    excluidos = set()
+    for cd in CamionDisponibilidad.objects.all():
+        dias_cam = {d.strip() for d in cd.dias.split(",") if d.strip()}
+        if dias_cam and dia not in dias_cam:
+            excluidos.add(cd.nombre_camion)
+    return excluidos
+
+
+def _camiones_dataframe(dia=""):
     cols = ["Nombre", "Capacidad (kg)", "Personas", "Viajes máx.", "Plantel Lat",
             "Plantel Lon", "Cantón asignado", "Distrito asignado"]
+    excluidos = _camiones_disponibles_ese_dia(dia)
     filas = [{
         "Nombre": c.nombre, "Capacidad (kg)": c.capacidad_kg, "Personas": c.personas,
         "Viajes máx.": c.viajes_max, "Plantel Lat": c.plantel_lat, "Plantel Lon": c.plantel_lon,
         "Cantón asignado": c.canton_asignado, "Distrito asignado": c.distrito_asignado,
-    } for c in Camion.objects.all()]
+    } for c in Camion.objects.all() if c.nombre not in excluidos]
     return pd.DataFrame(filas, columns=cols)
 
 
@@ -401,13 +453,58 @@ def _tabla_semana(resultado, rutas_frecuencia):
     return filas
 
 
+def _dia_actual_desde_request(request):
+    dia_actual = request.GET.get("dia", "")
+    if dia_actual not in DIAS_SEMANA:
+        dia_actual = ""
+    return dia_actual
+
+
+def _construir_dias_tabs():
+    dias_calculados = set(
+        ResultadoCalculo.objects.exclude(resultado_json__isnull=True).values_list("dia", flat=True)
+    )
+    return [{"dia": "", "etiqueta": "Todos", "calculado": "" in dias_calculados}] + [
+        {"dia": d, "etiqueta": d[:3], "calculado": d in dias_calculados} for d in DIAS_SEMANA
+    ]
+
+
 def calcular_view(request):
+    dia_actual = _dia_actual_desde_request(request)
+
     cantones_disponibles = sorted({
         p.canton.strip() for p in Punto.objects.exclude(canton="") if p.canton.strip()
     })
 
-    resultado_obj = ResultadoCalculo.cargar()
+    resultado_obj = ResultadoCalculo.cargar(dia_actual)
+    dias_tabs = _construir_dias_tabs()
+
+    nombres_camiones_todos = list(Camion.objects.order_by("nombre").values_list("nombre", flat=True))
+    excluidos_hoy = _camiones_disponibles_ese_dia(dia_actual)
+    camiones_disponibilidad = [
+        {"nombre": n, "disponible": n not in excluidos_hoy} for n in nombres_camiones_todos
+    ]
+
+    context = {
+        "modos_calculo": MODOS_CALCULO,
+        "modo_calculo_actual": resultado_obj.modo_calculo or "Todos los puntos juntos",
+        "cantones_disponibles": cantones_disponibles,
+        "dia_actual": dia_actual,
+        "dias_tabs": dias_tabs,
+        "camiones_disponibilidad": camiones_disponibilidad,
+        "camiones_activos_count": sum(1 for c in camiones_disponibilidad if c["disponible"]),
+        "camiones_total_count": len(camiones_disponibilidad),
+        "tiene_resultado_este_dia": bool(resultado_obj.resultado_json),
+    }
+    return render(request, "rutas/calcular.html", context)
+
+
+def resultados_view(request):
+    dia_actual = _dia_actual_desde_request(request)
+
+    resultado_obj = ResultadoCalculo.cargar(dia_actual)
     resultado = resultado_obj.resultado_json
+    dias_tabs = _construir_dias_tabs()
 
     rutas_frecuencia = {}
     tabla_semana = []
@@ -418,7 +515,13 @@ def calcular_view(request):
             for rf in RutaFrecuencia.objects.filter(nombre_ruta__in=nombres_rutas)
         }
         rutas_frecuencia = {nom: frecuencias.get(nom, "") for nom in nombres_rutas}
-        tabla_semana = _tabla_semana(resultado, rutas_frecuencia)
+        # Esta tabla multiplica el peso según cuántos días pasaron desde la
+        # última recolección de esa ruta — tiene sentido en "Todos" (un solo
+        # cálculo reusado toda la semana), pero NO cuando ya estás parado en
+        # el resultado propio de un día específico (ese ya es el peso real
+        # de ESE día, multiplicarlo de nuevo lo infla al doble/triple).
+        if not dia_actual:
+            tabla_semana = _tabla_semana(resultado, rutas_frecuencia)
 
     metricas = None
     camiones_excedidos = []
@@ -441,9 +544,6 @@ def calcular_view(request):
             })
 
     context = {
-        "modos_calculo": MODOS_CALCULO,
-        "modo_calculo_actual": resultado_obj.modo_calculo or "Todos los puntos juntos",
-        "cantones_disponibles": cantones_disponibles,
         "resultado": resultado,
         "resultado_json": json.dumps(resultado) if resultado else "null",
         "rutas_info": rutas_info,
@@ -453,27 +553,127 @@ def calcular_view(request):
         "tabla_semana": tabla_semana,
         "metricas": metricas,
         "camiones_excedidos": camiones_excedidos,
+        "dia_actual": dia_actual,
+        "dias_tabs": dias_tabs,
     }
-    return render(request, "rutas/calcular.html", context)
+    return render(request, "rutas/resultados.html", context)
+
+
+def _redirect_calcular(dia):
+    url = reverse("rutas:calcular")
+    return redirect(f"{url}?dia={dia}" if dia else url)
+
+
+def _redirect_resultados(dia):
+    url = reverse("rutas:resultados")
+    return redirect(f"{url}?dia={dia}" if dia else url)
+
+
+def _aplicar_frecuencia_acumulada(camiones_res, dia, kwargs_comunes, nombre_frecuencia=None):
+    """Si `dia` es un día específico y una ruta YA CALCULADA tiene una
+    frecuencia guardada (RutaFrecuencia) que acumula más de un día para esa
+    fecha, vuelve a resolver SOLO ese camión con el peso real acumulado —
+    y con tantos viajes como hagan falta para cubrirlo, no el "Viajes máx."
+    configurado (que es un promedio semanal, no el tope de un día pesado).
+    Modifica camiones_res en el lugar.
+
+    No aplica en modo "Todos" (dia=""), porque ahí la frecuencia solo sirve
+    para la tabla informativa "Peso estimado por día de la semana" — cambiar
+    ese resultado único reusado toda la semana sería un cambio de alcance
+    mayor, no lo que se pidió acá.
+
+    nombre_frecuencia: función opcional nombre_crudo_del_camión -> nombre
+    usado para buscar en RutaFrecuencia (por defecto, el mismo nombre). En
+    modo por zona la frecuencia se guarda con el nombre YA combinado (ej.
+    "Barrantes — Camión Barrantes"), pero el Camion en la base de datos se
+    busca siempre por su nombre crudo ("Camión Barrantes").
+    """
+    if not dia:
+        return
+    if nombre_frecuencia is None:
+        nombre_frecuencia = lambda nombre: nombre  # noqa: E731
+
+    nombres_busqueda = [nombre_frecuencia(c["nombre"]) for c in camiones_res]
+    frecuencias = {
+        rf.nombre_ruta: rf.dias
+        for rf in RutaFrecuencia.objects.filter(nombre_ruta__in=nombres_busqueda)
+    }
+    for idx, c in enumerate(camiones_res):
+        dias_ruta_str = frecuencias.get(nombre_frecuencia(c["nombre"]), "")
+        dias_de_la_ruta = [d.strip() for d in dias_ruta_str.split(",") if d.strip()]
+        if len(dias_de_la_ruta) < 2:
+            continue  # sin frecuencia multi-día guardada, nada que acumular
+
+        gap = dias_desde_ultima_recoleccion(dia, dias_de_la_ruta)
+        if gap <= 1:
+            continue
+
+        camion = Camion.objects.filter(nombre=c["nombre"]).first()
+        if camion is None or camion.plantel_lat is None or camion.plantel_lon is None:
+            continue
+
+        paradas = [f for f in c["resumen"] if f["tipo"] == "parada"]
+        if not paradas:
+            continue
+
+        # El VRP recoge cada parada ENTERA en un solo viaje — no reparte el
+        # peso de UN mismo punto entre dos viajes. Si al acumular el peso de
+        # varios días un punto por sí solo supera la capacidad del camión
+        # (ej. 10 000 kg con un camión de 5 000 kg), el cálculo sería
+        # imposible tal cual. Para simular la vuelta real del camión, ese
+        # punto se parte en "copias" en la misma ubicación, cada una hasta
+        # la capacidad del camión — el VRP las reparte en viajes distintos,
+        # con el costo real de ida/vuelta entre cada una.
+        filas_puntos = []
+        for f in paradas:
+            restante = f["Peso recogido (kg)"] * gap
+            while restante > 0:
+                porcion = min(restante, camion.capacidad_kg)
+                filas_puntos.append({
+                    "Nombre": f["Nombre"], "Latitud": f["lat"], "Longitud": f["lon"],
+                    "Peso (kg)": porcion, "Camión": "Auto",
+                })
+                restante -= porcion
+        puntos_grupo = pd.DataFrame(filas_puntos)
+
+        viajes_necesarios = max(1, math.ceil(puntos_grupo["Peso (kg)"].sum() / camion.capacidad_kg))
+        cams_uno = pd.DataFrame([{
+            "Nombre": camion.nombre, "Capacidad (kg)": camion.capacidad_kg,
+            "Personas": camion.personas, "Viajes máx.": viajes_necesarios,
+            "Plantel Lat": camion.plantel_lat, "Plantel Lon": camion.plantel_lon,
+        }])
+
+        resultado_uno, error = calcular_rutas_para_puntos(puntos_grupo, cams_uno, **kwargs_comunes)
+        if error or not resultado_uno["camiones"]:
+            continue
+        nuevo = resultado_uno["camiones"][0]
+        nuevo["nombre"] = c["nombre"]
+        nuevo["gap_acumulado"] = gap
+        camiones_res[idx] = nuevo
 
 
 @require_POST
 def api_ejecutar_calculo(request):
+    dia = request.POST.get("dia", "")
+    if dia not in DIAS_SEMANA:
+        dia = ""
+
     config = ConfiguracionGeneral.cargar()
     modo_calculo = request.POST.get("modo_calculo", "Todos los puntos juntos")
 
     tabla = _puntos_dataframe()
-    tabla_camiones = _camiones_dataframe()
+    tabla_camiones = _camiones_dataframe(dia)
 
     puntos_todos = tabla.dropna(subset=["Latitud", "Longitud"])
     cams = tabla_camiones.dropna(subset=["Nombre", "Capacidad (kg)"])
 
     if len(puntos_todos) < 1:
         messages.error(request, "Necesitás al menos 1 punto con coordenadas.")
-        return redirect("rutas:calcular")
+        return _redirect_calcular(dia)
     if len(cams) < 1:
-        messages.error(request, "Necesitás al menos 1 camión (pestaña Camiones).")
-        return redirect("rutas:calcular")
+        etiqueta_dia = f" disponible el {dia}" if dia else ""
+        messages.error(request, f"Necesitás al menos 1 camión{etiqueta_dia} (pestaña Camiones).")
+        return _redirect_calcular(dia)
 
     kwargs_comunes = dict(
         depot2_lat=config.depot2_lat, depot2_lon=config.depot2_lon,
@@ -491,7 +691,8 @@ def api_ejecutar_calculo(request):
         resultado, error = calcular_rutas_para_puntos(puntos_todos, cams, **kwargs_comunes)
         if error:
             messages.error(request, error)
-            return redirect("rutas:calcular")
+            return _redirect_calcular(dia)
+        _aplicar_frecuencia_acumulada(resultado["camiones"], dia, kwargs_comunes)
     else:
         canton_de_distrito = {}
         for _, fila_p in puntos_todos.dropna(subset=["Distrito"]).iterrows():
@@ -508,7 +709,7 @@ def api_ejecutar_calculo(request):
             )
             if not cantones_disponibles:
                 messages.error(request, "No hay cantones para el modo Mixto — llenalo en la pestaña Puntos.")
-                return redirect("rutas:calcular")
+                return _redirect_calcular(dia)
             for canton_actual in cantones_disponibles:
                 nivel = request.POST.get(f"nivel__{canton_actual}", "Cantón completo")
                 if nivel == "Cantón completo":
@@ -536,7 +737,7 @@ def api_ejecutar_calculo(request):
                 f"No hay ningún punto con datos completos para agrupar por {etiqueta_modo} — "
                 "revisá Cantón/Distrito en la pestaña Puntos.",
             )
-            return redirect("rutas:calcular")
+            return _redirect_calcular(dia)
 
         resultados_grupos = {}
         errores_grupos = []
@@ -554,6 +755,10 @@ def api_ejecutar_calculo(request):
             if error:
                 errores_grupos.append(f"{grupo_key}: {error}")
             else:
+                _aplicar_frecuencia_acumulada(
+                    resultado_grupo["camiones"], dia, kwargs_comunes,
+                    nombre_frecuencia=lambda n, gk=grupo_key: f"{gk} — {n}",
+                )
                 resultados_grupos[grupo_key] = resultado_grupo
 
         if not resultados_grupos:
@@ -561,7 +766,7 @@ def api_ejecutar_calculo(request):
                 request,
                 f"No se pudo calcular ninguna ruta por {etiqueta_modo}. " + " | ".join(errores_grupos),
             )
-            return redirect("rutas:calcular")
+            return _redirect_calcular(dia)
 
         camiones_combinados = []
         errores_osrm_combinados = []
@@ -587,14 +792,15 @@ def api_ejecutar_calculo(request):
                 + " | ".join(errores_grupos),
             )
 
-    resultado_obj = ResultadoCalculo.cargar()
+    resultado_obj = ResultadoCalculo.cargar(dia)
     resultado_obj.resultado_json = resultado
     resultado_obj.modo_calculo = modo_calculo
     resultado_obj.calculado_en = timezone.now()
     resultado_obj.save()
 
-    messages.success(request, f"Rutas calculadas para {len(resultado['camiones'])} camión(es).")
-    return redirect("rutas:calcular")
+    etiqueta_dia = f" para el {dia}" if dia else ""
+    messages.success(request, f"Rutas calculadas{etiqueta_dia} para {len(resultado['camiones'])} camión(es).")
+    return _redirect_resultados(dia)
 
 
 @require_POST
@@ -607,7 +813,10 @@ def api_guardar_frecuencia(request):
             nombre_ruta=ruta_nombre, defaults={"dias": ",".join(dias_marcados)}
         )
         idx += 1
-    return redirect("rutas:calcular")
+    dia = request.POST.get("dia", "")
+    if dia not in DIAS_SEMANA:
+        dia = ""
+    return _redirect_resultados(dia)
 
 
 def _inversion_to_row(c):
