@@ -9,7 +9,9 @@ un app.py monolitico del que extraer.
 
 Mockea obtener_matriz_osrm / obtener_ruta_completa_osrm para no requerir red.
 """
+from datetime import datetime as dt
 from datetime import time as dtime
+from datetime import timedelta as td
 from unittest import mock
 
 import pandas as pd
@@ -81,6 +83,14 @@ def test_todos_los_escenarios(mock_matriz, mock_ruta):
     assert len(filas_descarga) == 1
     print(f"✔ Descarga registrada: {filas_descarga[0]['Parada']} a las {filas_descarga[0]['Hora llegada']}")
 
+    filas_sale_vacio = [f for f in resumen if f["tipo"] == "sale_vacio"]
+    assert len(filas_sale_vacio) == 1, f"Se esperaba 1 fila 'Sale vacío', hubo {len(filas_sale_vacio)}"
+    hora_descarga = dt.strptime(filas_descarga[0]["Hora llegada"], "%H:%M")
+    hora_sale_vacio = dt.strptime(filas_sale_vacio[0]["Hora llegada"], "%H:%M")
+    minutos_descarga = (hora_sale_vacio - hora_descarga).total_seconds() / 60
+    assert minutos_descarga == 30, f"'Sale vacío' debería ser 30 min después de la descarga, fue {minutos_descarga}"
+    print(f"✔ 'Sale vacío' registrado {minutos_descarga:.0f} min después de la descarga, a las {filas_sale_vacio[0]['Hora llegada']}")
+
     for f in resumen:
         print(f"   {f['orden']:>2} | {f['tipo']:<9} | {f['Hora llegada']} | {f['Parada']}")
     print(f"   -> Hora fin: {c['hora_fin']} | horas_jornada={c['horas_jornada']} | excede_jornada={c['excede_jornada']}")
@@ -130,6 +140,56 @@ def test_todos_los_escenarios(mock_matriz, mock_ruta):
     assert core.peso_estimado_ruta_para_dia(1000, "", "Lunes") == 1000  # sin asignar -> tal cual
     print("\n✔ Frecuencia por ruta (post-cálculo): Jueves=9000kg, Lunes=12000kg, "
           "sin asignar=1000kg tal cual")
+
+    # ═══════════════════════════════════════════════════════════
+    # Escenario 5: el almuerzo SIEMPRE dura la duración completa
+    # configurada (fin - inicio de la ventana), sin importar en qué
+    # momento de la ventana arranca. Antes, si el camión llegaba tarde
+    # DENTRO de la ventana (ej. 12:29 con cierre a las 12:30), el
+    # almuerzo se acortaba a solo 1 minuto en vez de la hora completa.
+    # ═══════════════════════════════════════════════════════════
+    hora_llegada_tardia = dt(2026, 1, 1, 12, 19)  # +10 min de parada -> 12:29
+    _, tomado5, fila5 = core.avanzar_reloj_tras_parada(
+        hora_llegada_tardia, False, 10, 30, False, dtime(11, 30), dtime(12, 30),
+    )
+    assert tomado5 is True
+    duracion5 = fila5["fin"] - fila5["inicio"]
+    assert duracion5 == td(hours=1), f"El almuerzo debería durar 1h completa, duró {duracion5}"
+    print(f"\n✔ Almuerzo iniciado casi al cierre de la ventana (12:29) igual dura {duracion5}, de "
+          f"{fila5['inicio'].strftime('%H:%M')} a {fila5['fin'].strftime('%H:%M')}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Escenario 6: el almuerzo no se salta si el mediodía cae DURANTE el
+    # tramo final de regreso al plantel (y no justo en una parada
+    # anterior) — antes, ese tramo no se revisaba y el camión se quedaba
+    # sin almorzar ese día.
+    # ═══════════════════════════════════════════════════════════
+    puntos_cercanos = pd.DataFrame({
+        "Nombre": ["MuyCerca"], "Latitud": [9.9645], "Longitud": [-84.1613],
+        "Peso (kg)": [500], "Camión": ["Auto"],
+    })
+    camiones_plantel_lejos = pd.DataFrame({
+        "Nombre": ["Camión X"], "Capacidad (kg)": [5000.0], "Personas": [1],
+        "Viajes máx.": [1], "Plantel Lat": [10.04], "Plantel Lon": [-84.16],
+    })
+    resultado6, error6 = core.calcular_rutas_para_puntos(
+        puntos_cercanos, camiones_plantel_lejos, depot2_lat=9.964356, depot2_lon=-84.161528,
+        hora_inicio=dtime(11, 20), velocidad_kmh=20, tiempo_parada=5,
+        balancear=False, tiempo_descarga=10,
+        hora_almuerzo_inicio=dtime(12, 0), hora_almuerzo_fin=dtime(13, 0),
+        tope_horas_jornada=8.0,
+    )
+    assert error6 is None, f"Error inesperado: {error6}"
+    resumen6 = resultado6["camiones"][0]["resumen"]
+    tipos6 = [f["tipo"] for f in resumen6]
+    idx_descarga6 = tipos6.index("descarga")
+    assert resumen6[idx_descarga6]["Hora llegada"] < "12:00", (
+        "este escenario requiere que la descarga sea ANTES del mediodía, "
+        "para que el cruce ocurra recién en el tramo de regreso al plantel"
+    )
+    assert "almuerzo" in tipos6, "el almuerzo no debería saltarse en el tramo final de regreso al plantel"
+    print(f"✔ Almuerzo no se salta en el tramo final de regreso al plantel "
+          f"(descarga a las {resumen6[idx_descarga6]['Hora llegada']}, almuerzo sí insertado)")
 
     print("\n=== TODOS LOS ESCENARIOS PASARON ===")
 

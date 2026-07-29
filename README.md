@@ -104,11 +104,7 @@ python manage.py runserver
 
 La base de datos por defecto es SQLite (`db.sqlite3`, no versionado).
 
-Antes de tocar `core/optimizador.py`, correr las pruebas:
-
-```bash
-python -m pytest core/tests/test_modelo_tiempo.py -q
-```
+Antes de tocar `core/optimizador.py`, correr las pruebas (ver sección Tests).
 
 ## Actualización — 2026-07-28
 
@@ -153,9 +149,31 @@ python -m pytest core/tests/test_modelo_tiempo.py -q
 - Tablas con encabezados en negrita, divisores de columna más visibles, y
   tipografía más grande en general.
 
+**Tests**
+- 3 escenarios nuevos en `core/tests/test_modelo_tiempo.py`: duración
+  completa del almuerzo, almuerzo no salteado en el tramo final, y la fila
+  "Sale vacío".
+- Suite nueva `rutas/tests/test_validaciones.py` (Django, base de datos de
+  test en memoria): límites de los modelos y guardado "todo o nada" de
+  Puntos/Camiones.
+
+## Tests
+
+```bash
+python -m pytest core/tests/test_modelo_tiempo.py -q   # lógica pura (core/)
+python manage.py test rutas                             # validaciones y vistas (Django)
+```
+
+`rutas/tests/test_validaciones.py` cubre los límites de los modelos (Punto,
+Camion, ConfiguracionGeneral) y el comportamiento "todo o nada" de guardar
+Puntos/Camiones (una fila inválida rechaza el lote completo sin tocar lo que
+ya había). Corre sobre la base de datos de test que crea Django (en
+memoria) — nunca toca `db.sqlite3`.
+
 ## Pendientes
 
 - Migrar de SQLite a Postgres para producción.
-- Tests automáticos de las vistas de Django (hoy solo `core/` tiene pruebas).
+- Ampliar los tests de Django a más vistas (Calcular/Resultados, Costos,
+  Red propia) — hoy solo cubren las validaciones de guardado.
 - Revisar diseño responsive / mobile.
 - Evaluar cálculo en background (Celery) si el volumen de datos crece.
