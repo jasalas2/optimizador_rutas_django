@@ -66,6 +66,7 @@
     <div class="stat"><div class="eyebrow">Distancia total</div><div class="val">{{ metricas.dist_total_km|floatformat:1 }} <small>km</small></div></div>
     <div class="stat"><div class="eyebrow">Peso total</div><div class="val">{{ metricas.peso_total|floatformat:0 }} <small>kg</small></div></div>
     <div class="stat {% if camiones_excedidos %}warn{% endif %}"><div class="eyebrow">Fin estimado</div><div class="val">{{ metricas.hora_fin_max }}</div></div>
+    <div class="stat warn"><div class="eyebrow">A relleno ({{ metricas.porcentaje_relleno|floatformat:0 }}%)</div><div class="val">{{ metricas.peso_relleno|floatformat:0 }} <small>kg</small></div><div class="sub">Neto a Planta San Antonio: {{ metricas.peso_neto|floatformat:0 }} kg</div></div>
   </div>
 
   {% if camiones_excedidos %}

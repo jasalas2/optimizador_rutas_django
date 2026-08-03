@@ -1,0 +1,113 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Reporte por ruta — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<style>
+  .dias-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .dia-tab {
+    font-family: var(--sans); font-size: 12px; font-weight: 700; padding: 7px 4px;
+    border-radius: 8px; border: 1.5px solid var(--border); background: var(--surface);
+    color: var(--text-muted); cursor: pointer; width: 58px; text-align: center;
+    display: flex; flex-direction: column; gap: 3px; align-items: center; text-decoration: none;
+  }
+  .dia-tab .estado { font-size: 14px; line-height: 1; }
+  .dia-tab.activo { border-color: var(--accent-strong); background: var(--accent-soft); color: var(--accent-strong); }
+  .dia-tab .estado.ok { color: var(--accent-strong); }
+  .dia-tab .estado.pend { color: var(--text-faint); }
+
+  table.reporte { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.reporte th, table.reporte td {
+    padding: 10px 14px; border-bottom: 1px solid var(--border); border-right: 2px solid var(--border);
+    white-space: nowrap;
+  }
+  table.reporte th:last-child, table.reporte td:last-child { border-right: none; }
+  table.reporte thead tr.grupo th {
+    background: var(--surface-sunken); font-size: 10.5px; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--text-faint); font-weight: 800; text-align: center;
+  }
+  table.reporte thead tr.campo th {
+    background: var(--surface-sunken); font-size: 11px; font-weight: 700; color: var(--text);
+    text-align: right; border-bottom: 2px solid var(--border-strong);
+  }
+  table.reporte thead tr.campo th:first-child,
+  table.reporte tbody td:first-child { text-align: left; }
+  table.reporte tbody td { text-align: right; font-variant-numeric: tabular-nums; }
+  table.reporte tbody td:first-child { font-weight: 700; }
+  table.reporte .sep-grupo { border-left: 2px solid var(--border-strong); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Reporte por ruta</h1>
+    <div class="sub">Indicadores operativos por camión/ruta — identificación, distancia y consumo, y tiempo y mano
+      de obra — calculados a partir del detalle por camión del cálculo guardado para el día elegido.</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>¿Qué día querés ver?</h2></div>
+  <div class="card-body">
+    {% include "rutas/_dias_tabs.html" %}
+  </div>
+</div>
+
+{% if not resultado %}
+  <div class="msg info">
+    Todavía no hay rutas calculadas{% if dia_actual %} para el <b>{{ dia_actual }}</b>{% endif %}.
+    <a href="{% url 'rutas:calcular' %}?dia={{ dia_actual }}" style="font-weight:700;">Ir a Calcular →</a>
+  </div>
+{% else %}
+  <div class="card">
+    <div class="card-head"><h2>Reporte{% if dia_actual %} — {{ dia_actual }}{% endif %}</h2></div>
+    <div class="card-body flush">
+      <div class="tbl-wrap">
+        <table class="reporte">
+          <thead>
+            <tr class="grupo">
+              <th></th>
+              <th colspan="4">A. Identificación y operación de la ruta</th>
+              <th colspan="4" class="sep-grupo">B. Distancia y consumo</th>
+              <th colspan="4" class="sep-grupo">C. Tiempo y mano de obra</th>
+            </tr>
+            <tr class="campo">
+              <th>Ruta</th>
+              <th>Tipo de camión</th>
+              <th>Días operativos [días/año]</th>
+              <th>Viajes diarios [viajes/día]</th>
+              <th>Cant. orgánica recolectada [t/día]</th>
+              <th class="sep-grupo">Aproximación [km/día]</th>
+              <th>Durante recolección [km/día]</th>
+              <th>A planta [km/día]</th>
+              <th>Retorno [km/día]</th>
+              <th class="sep-grupo">Conducción [h/día]</th>
+              <th>Recolección y carga [h/día]</th>
+              <th>Descarga y espera [h/día]</th>
+              <th>Lavado [h/día]</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for f in filas_reporte %}
+              <tr>
+                <td>{{ f.nombre }}</td>
+                <td>{{ f.tipo_camion }}</td>
+                <td>{{ f.dias_operativos_anio }}</td>
+                <td>{{ f.viajes_diarios }}</td>
+                <td>{{ f.toneladas_dia|floatformat:2 }}</td>
+                <td class="sep-grupo">{{ f.aproximacion_km|floatformat:2 }}</td>
+                <td>{{ f.recoleccion_km|floatformat:2 }}</td>
+                <td>{{ f.a_planta_km|floatformat:2 }}</td>
+                <td>{{ f.retorno_km|floatformat:2 }}</td>
+                <td class="sep-grupo">{{ f.horas_conduccion|floatformat:2 }}</td>
+                <td>{{ f.horas_recoleccion|floatformat:2 }}</td>
+                <td>{{ f.horas_descarga|floatformat:2 }}</td>
+                <td>{{ f.horas_lavado|floatformat:2 }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+{% endif %}
+{% endblock %}

@@ -7,6 +7,7 @@ st.* y session_state. Cualquier cambio a este modulo debe seguir
 pasando core/tests/test_modelo_tiempo.py.
 """
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -988,6 +989,145 @@ def construir_grafo_red(gdf_lineas, tolerancia_m=5.0):
     return G, nodos
 
 
+def _osrm_match_tanda(tanda):
+    """Una sola consulta /match de OSRM para una tanda de <=10 puntos (límite
+    práctico del servidor público -- con más, responde 'TooBig'). Devuelve
+    la geometría ajustada de esa tanda, o None si falla."""
+    coords_str = ";".join(f"{lon},{lat}" for lon, lat in tanda)
+    url = (f"http://router.project-osrm.org/match/v1/driving/{coords_str}"
+           f"?geometries=geojson&overview=full")
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+    except Exception:
+        return None
+    if data.get("code") != "Ok" or not data.get("matchings"):
+        return None
+    return data["matchings"][0]["geometry"]["coordinates"]
+
+
+def _osrm_match_por_tramos(coords, tamano_tramo=9):
+    """
+    Ajusta una línea (lista de (lon, lat)) a la geometría real de calles
+    usando el servicio /match de OSRM, que "engancha" una secuencia de
+    puntos al camino más probable sobre la red vial real -- pensado para
+    trazas GPS, pero funciona igual de bien para limpiar un shapefile
+    digitalizado a mano.
+
+    El servidor público de OSRM tiene un límite bajo de puntos por consulta
+    (~10-11 -- probado a mano, no está documentado), así que se parte en
+    tandas de `tamano_tramo` puntos (con solapamiento de 1 punto entre
+    tandas, para no dejar huecos al unir), y las tandas se consultan EN
+    PARALELO (unas pocas a la vez) para que una línea con muchos puntos no
+    tarde una eternidad en resolverse en serie.
+
+    Devuelve la lista completa de (lon, lat) ajustada, o None si CUALQUIER
+    tanda falla (se prefiere no mezclar geometría ajustada con cruda dentro
+    de la misma línea -- el que llama cae a la geometría original completa
+    en ese caso).
+    """
+    if len(coords) < 2:
+        return None
+
+    tramos = []
+    i = 0
+    while i < len(coords) - 1:
+        fin = min(i + tamano_tramo, len(coords) - 1)
+        tramos.append(coords[i:fin + 1])
+        if fin == len(coords) - 1:
+            break
+        i = fin
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        geoms_por_tramo = list(pool.map(_osrm_match_tanda, tramos))
+
+    if any(g is None for g in geoms_por_tramo):
+        return None
+
+    resultado = []
+    for geom_tramo in geoms_por_tramo:
+        if resultado:
+            resultado.extend(geom_tramo[1:])  # el primer punto repite el último de la tanda anterior
+        else:
+            resultado.extend(geom_tramo)
+    return resultado if len(resultado) >= 2 else None
+
+
+def explotar_lineas_simples(gdf_lineas):
+    """
+    Devuelve una lista de geometrías LineString "simples" a partir de un
+    GeoDataFrame de líneas -- separando cada parte de una MultiLineString en
+    su propia entrada. Shapely no permite pedir `.coords` directamente sobre
+    una geometría multi-parte (lanza NotImplementedError), y un shapefile
+    real perfectamente puede traer filas MultiLineString (varias calles
+    agrupadas en una sola fila de atributos).
+    """
+    simples = []
+    for geom in gdf_lineas.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        if geom.geom_type == "LineString":
+            simples.append(geom)
+        elif geom.geom_type == "MultiLineString":
+            simples.extend(geom.geoms)
+    return simples
+
+
+def ajustar_una_linea_con_osrm(geom, tolerancia_simplificado=0.00008):
+    """
+    Ajusta UNA línea a la geometría real de calles (vía OSRM /match) -- ver
+    limpiar_lineas_con_osrm para el detalle de por qué se simplifica antes
+    de mandarla. Separada como función aparte (no solo un paso interno del
+    for de limpiar_lineas_con_osrm) para que quien cargue una red con
+    muchas líneas pueda ir reportando progreso línea por línea, en vez de
+    esperar a que las 24 (o las que sean) terminen todas juntas.
+
+    Devuelve (coords, se_ajustó): coords es la lista de (lon, lat) a usar
+    (ajustada si se pudo, original si no), se_ajustó indica cuál de las dos.
+    """
+    original = list(geom.coords)
+    simplificada = list(geom.simplify(tolerancia_simplificado).coords)
+    ajustada = _osrm_match_por_tramos(simplificada if len(simplificada) >= 2 else original)
+    if ajustada:
+        return ajustada, True
+    return original, False
+
+
+def limpiar_lineas_con_osrm(lineas_geoms, tolerancia_simplificado=0.00008):
+    """
+    Ajusta cada línea (ya "simple", ver explotar_lineas_simples) a la
+    geometría real de calles (vía OSRM /match), UNA SOLA VEZ al cargar la
+    red -- así el recorrido de cobertura total que se calcule después (que
+    puede tener miles de puntos, por las aristas repetidas) hereda calles
+    reales sin tener que consultar OSRM en cada cálculo.
+
+    Antes de mandar cada línea a OSRM se SIMPLIFICA (Douglas-Peucker, vía
+    shapely) con `tolerancia_simplificado` grados (~8-9 metros por
+    defecto): un shapefile digitalizado a mano suele traer muchos puntos
+    casi-colineales que no aportan nada a la forma real de la calle, y cada
+    punto de más es una consulta de más al servidor público de OSRM (que
+    solo acepta ~10 puntos por consulta).
+
+    Si OSRM no logra ajustar una línea en particular (falla la consulta, no
+    hay calle cercana, etc.), esa línea se deja con su geometría original
+    (SIN simplificar) -- no se descarta la red completa por una línea
+    problemática.
+
+    Devuelve (lineas_ajustadas, n_ajustadas):
+      - lineas_ajustadas: lista de listas de (lon, lat), una por línea de
+        `lineas_geoms`, en el mismo orden (ajustada si se pudo, original si no).
+      - n_ajustadas: cantidad de líneas que sí se pudieron ajustar.
+    """
+    lineas_ajustadas = []
+    n_ajustadas = 0
+    for geom in lineas_geoms:
+        coords, se_ajusto = ajustar_una_linea_con_osrm(geom, tolerancia_simplificado)
+        lineas_ajustadas.append(coords)
+        if se_ajusto:
+            n_ajustadas += 1
+    return lineas_ajustadas, n_ajustadas
+
+
 def enganchar_a_red(punto_lonlat, nodos):
     """Nodo más cercano de la red a un punto dado. Devuelve (nodo_id, distancia_m)."""
     mejor_id, mejor_dist = None, float("inf")
@@ -1173,6 +1313,170 @@ def camino_geometria_red(G, nodos, nodo_a, nodo_b):
         return [nodos[n] for n in ruta]
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return [nodos[nodo_a], nodos[nodo_b]]
+
+
+def calcular_recorrido_cobertura_total(G, nodo_inicio):
+    """
+    Problema del Cartero Chino (Route Inspection Problem): recorrido CERRADO
+    que cubre TODAS las aristas del grafo al menos una vez, minimizando la
+    distancia repetida. A diferencia de resolver_vrp/matriz_distancias_red
+    (que eligen el mejor orden para visitar un subconjunto de puntos), acá
+    no se elige nada -- hay que pasar por cada calle del grafo sí o sí. Es
+    el algoritmo que usa "Red propia" para acelerar una ruta que YA recorre
+    la red completa, no para armar una ruta nueva más corta.
+
+    Función completamente nueva e independiente -- no modifica ni reutiliza
+    resolver_vrp ni ninguna otra lógica del optimizador principal.
+
+    Pasos clásicos del algoritmo:
+      1. Encontrar los nodos de grado impar (en un grafo con todos los
+         nodos de grado par, ya se puede recorrer cada arista una sola vez
+         sin repetir nada -- eso casi nunca pasa en una red real: hay
+         callejones sin salida y cruces de 3 vías).
+      2. Calcular la distancia más corta (por la red) entre cada par de
+         nodos impares.
+      3. Emparejarlos de la forma más barata posible (emparejamiento de
+         peso mínimo) -- cada par emparejado indica qué tramo hay que
+         repetir para "parchar" esos dos nodos y dejarlos de grado par.
+      4. Duplicar esos tramos (como aristas paralelas) y armar el circuito
+         que recorre cada arista (incluidas las duplicadas) exactamente una
+         vez -- un circuito euleriano, que por construcción siempre empieza
+         y termina en el mismo nodo.
+
+    G: networkx.Graph con pesos en "weight" (metros), tal como lo arma
+    construir_grafo_red(). nodo_inicio: id de nodo (índice en la lista de
+    `nodos` de construir_grafo_red) donde empieza y termina el recorrido.
+
+    Si el grafo está fragmentado (varios componentes no conectados), solo
+    se resuelve el componente que contiene a nodo_inicio -- el resto queda
+    afuera y se reporta en "nodos_excluidos" para poder avisarle al usuario,
+    en vez de fallar.
+
+    Devuelve un dict, o None si nodo_inicio no existe en el grafo:
+      - "componente_size": cantidad de nodos en el componente usado
+      - "nodos_excluidos": cantidad de nodos del grafo fuera de ese componente
+      - "ruta_nodos": lista de ids de nodo, en el orden del recorrido
+        (empieza y termina en nodo_inicio)
+      - "distancia_original_m": suma de las aristas ÚNICAS del componente
+        (la longitud real de calles a cubrir)
+      - "distancia_repetida_m": metros de más por los tramos duplicados,
+        necesarios para poder cerrar el circuito
+      - "distancia_total_m": distancia_original_m + distancia_repetida_m
+      - "aristas_duplicadas": lista de (a, b) de las aristas que se repiten
+
+    Rendimiento: el paso más caro es encontrar el emparejamiento de peso
+    mínimo entre los nodos de grado impar -- el algoritmo exacto (blossom)
+    es O(k³) en la cantidad de nodos impares, y en Python puro se vuelve
+    inutilizable con redes viales reales (con ~700 nodos impares, más de un
+    minuto). Para que siga siendo exacto pero rápido:
+      - Las distancias por la red entre nodos impares se calculan con
+        `scipy.sparse.csgraph.dijkstra` (vectorizado, en C) en vez de
+        Dijkstra de networkx nodo por nodo -- foto completa en <1s en vez
+        de decenas de segundos.
+      - El emparejamiento no se corre sobre el grafo COMPLETO de pares
+        impares (k² aristas) sino sobre uno con solo los N vecinos más
+        cercanos de cada nodo -- el emparejamiento óptimo casi siempre usa
+        pares cercanos, así que el resultado sigue siendo el óptimo exacto
+        (verificado contra el cálculo completo con datos reales), pero el
+        blossom corre sobre un grafo mucho más chico. Si con ese vecindario
+        no alcanza para un emparejamiento perfecto (puede pasar si queda
+        muy disperso), se reintenta duplicando el vecindario hasta lograrlo.
+    """
+    import networkx as nx
+    import numpy as np
+    from scipy.sparse.csgraph import dijkstra as _dijkstra_scipy
+
+    if nodo_inicio not in G:
+        return None
+
+    componente = nx.node_connected_component(G, nodo_inicio)
+    H = G.subgraph(componente).copy()
+    distancia_original_m = sum(d["weight"] for _, _, d in H.edges(data=True))
+
+    if H.number_of_edges() == 0:
+        return {
+            "componente_size": len(componente),
+            "nodos_excluidos": G.number_of_nodes() - len(componente),
+            "ruta_nodos": [nodo_inicio],
+            "distancia_original_m": 0.0,
+            "distancia_repetida_m": 0.0,
+            "distancia_total_m": 0.0,
+            "aristas_duplicadas": [],
+        }
+
+    grados_impares = [n for n in H.nodes if H.degree(n) % 2 == 1]
+    aristas_duplicadas = []
+    distancia_repetida_m = 0.0
+    M = nx.MultiGraph(H)
+
+    if grados_impares:
+        nodelist = list(H.nodes())
+        idx_de_nodo = {n: i for i, n in enumerate(nodelist)}
+        csr = nx.to_scipy_sparse_array(H, nodelist=nodelist, weight="weight", format="csr")
+        indices_impares = [idx_de_nodo[n] for n in grados_impares]
+
+        dist_mat, predecesores = _dijkstra_scipy(
+            csr, directed=False, indices=indices_impares, return_predecessors=True)
+        sub = dist_mat[:, indices_impares]  # k x k, distancias entre nodos impares
+        k = len(grados_impares)
+
+        def _construir_aux(n_vecinos):
+            aux = nx.Graph()
+            aux.add_nodes_from(range(k))
+            for i in range(k):
+                vecinos = np.argsort(sub[i])
+                agregados = 0
+                for j in vecinos:
+                    if j == i or not np.isfinite(sub[i, j]):
+                        continue
+                    aux.add_edge(i, j, weight=sub[i, j])
+                    agregados += 1
+                    if agregados >= n_vecinos:
+                        break
+            return aux
+
+        n_vecinos = min(25, k - 1)
+        emparejamiento_local = []
+        while True:
+            aux = _construir_aux(n_vecinos)
+            emparejamiento_local = nx.algorithms.matching.min_weight_matching(aux)
+            if len(emparejamiento_local) * 2 == k or n_vecinos >= k - 1:
+                break
+            n_vecinos = min(n_vecinos * 2, k - 1)
+
+        def _camino_desde_predecesores(fila_pred, origen_idx, destino_idx):
+            camino_idx = [destino_idx]
+            actual = destino_idx
+            while actual != origen_idx:
+                actual = fila_pred[actual]
+                camino_idx.append(actual)
+            camino_idx.reverse()
+            return [nodelist[i] for i in camino_idx]
+
+        for i, j in emparejamiento_local:
+            u, v = grados_impares[i], grados_impares[j]
+            camino = _camino_desde_predecesores(predecesores[i], idx_de_nodo[u], idx_de_nodo[v])
+            for a, b in zip(camino, camino[1:]):
+                peso = H[a][b]["weight"]
+                M.add_edge(a, b, weight=peso)
+                aristas_duplicadas.append((a, b))
+                distancia_repetida_m += peso
+
+    if not nx.is_eulerian(M):
+        return None
+
+    circuito = list(nx.eulerian_circuit(M, source=nodo_inicio))
+    ruta_nodos = [circuito[0][0]] + [b for _, b in circuito]
+
+    return {
+        "componente_size": len(componente),
+        "nodos_excluidos": G.number_of_nodes() - len(componente),
+        "ruta_nodos": ruta_nodos,
+        "distancia_original_m": distancia_original_m,
+        "distancia_repetida_m": distancia_repetida_m,
+        "distancia_total_m": distancia_original_m + distancia_repetida_m,
+        "aristas_duplicadas": aristas_duplicadas,
+    }
 
 
 def _normalizar_gdf_lineas(gdf):

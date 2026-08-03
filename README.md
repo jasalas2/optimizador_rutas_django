@@ -37,7 +37,7 @@ contra lo que cuesta el modelo de recolección actual.
 | **Resultados** | Mapa con selector de rutas, "Frecuencia por ruta", detalle por camión, y alerta si algún camión excede el tope de jornada. Tiene su propio selector de día para repasar cualquier cálculo ya guardado sin recalcular. |
 | **Costos** | Comparación modelo actual vs. modelo nuevo; estructura completa de costos; costo real por tonelada calculado automáticamente. |
 | **Exportar** | CSV, GeoJSON, Shapefile, GPX, KML, y links directos a Google Maps y Waze. |
-| **Red propia** *(Beta)* | Rutea sobre un shapefile de calles propio en vez de la red pública de OpenStreetMap. |
+| **Red propia** *(Beta)* | Subís tu propio shapefile de calles (se ajusta automáticamente a calles reales de OSM) y calcula un recorrido CERRADO que cubre toda la red al menos una vez (Cartero Chino / Route Inspection) — pensado para acelerar una ruta de recolección que ya cubre todo el sector, no para elegir el mejor orden entre paradas sueltas. |
 | **Recolección en vía** *(Beta)* | Estima kilogramos adicionales según el tipo de calle que atraviesa cada ruta, con mapa de verificación por capas. Opcionalmente, ese kg extra puede sumarse como recolección real y reflejarse en Costos. |
 
 ## Frecuencia por ruta
@@ -98,13 +98,108 @@ rutas/static/rutas/     # style.css (sistema de diseño) y app.js (helpers compa
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -r requirements.txt
+```
+
+### Base de datos (Postgres)
+
+La app usa Postgres (antes usaba SQLite en desarrollo). Necesitás un
+Postgres corriendo localmente (o accesible) y crear la base y el usuario
+una vez:
+
+```sql
+-- conectado como superusuario (psql -U postgres):
+CREATE DATABASE optimizador_rutas;
+CREATE USER optimizador_app WITH PASSWORD 'elegí-una-contraseña';
+GRANT ALL PRIVILEGES ON DATABASE optimizador_rutas TO optimizador_app;
+-- Postgres 15+ requiere además el permiso sobre el schema:
+\c optimizador_rutas
+GRANT ALL ON SCHEMA public TO optimizador_app;
+-- para poder correr los tests de Django (crean una base temporal):
+ALTER USER optimizador_app CREATEDB;
+```
+
+Copiá `.env.example` a `.env` y completá `DB_PASSWORD` con la contraseña
+que elegiste (`.env` nunca se sube a git):
+
+```bash
+cp .env.example .env
+```
+
+Con eso listo:
+
+```bash
 python manage.py migrate
 python manage.py runserver
 ```
 
-La base de datos por defecto es SQLite (`db.sqlite3`, no versionado).
-
 Antes de tocar `core/optimizador.py`, correr las pruebas (ver sección Tests).
+
+### Con Docker (alternativa)
+
+Para correr todo (Django + su propio Postgres) sin instalar nada más que
+Docker Desktop:
+
+```bash
+cp .env.example .env   # completar DB_PASSWORD con lo que quieras
+docker compose up --build
+```
+
+Aplica las migraciones solas al arrancar (`entrypoint.sh`) y queda escuchando
+en `http://localhost:8000`. Este Postgres es uno nuevo y separado del que
+tengas instalado localmente — no comparte datos con él. Para cargar los
+datos reales exportados (`backup_datos_reales.json`) ahí adentro:
+
+```bash
+docker compose cp backup_datos_reales.json web:/app/backup_datos_reales.json
+docker compose exec web python manage.py loaddata backup_datos_reales.json
+```
+
+`docker compose down` para bajar todo (`-v` al final si además querés borrar
+los datos del Postgres del contenedor).
+
+## Actualización — 2026-08-03
+
+**Red propia: de "mejor ruta entre puntos" a cobertura total de la red**
+- Nuevo motor en `core/optimizador.py`: `calcular_recorrido_cobertura_total()`
+  resuelve el Problema del Cartero Chino (Route Inspection) sobre el grafo
+  cargado -- un recorrido CERRADO que cubre cada calle al menos una vez y
+  minimiza la distancia repetida, en vez de elegir el mejor orden entre
+  puntos sueltos (que era el enfoque anterior, tipo TSP). No modifica ni
+  reutiliza `resolver_vrp` ni nada del optimizador principal.
+- Optimizado con `scipy.sparse.csgraph.dijkstra` (vectorizado) +
+  emparejamiento por vecinos cercanos en vez del emparejamiento óptimo sobre
+  el grafo completo -- de ~125s a ~6s sobre una red real de 10,000+ nodos,
+  con el mismo resultado exacto (verificado).
+- **Ajuste a calles reales (OSM)**: cada línea del shapefile subido se
+  "engancha" una sola vez, al cargar la red, a la geometría real de OSM vía
+  el servicio `/match` de OSRM (`limpiar_lineas_con_osrm`) -- así el
+  recorrido calculado sigue calles reales en vez de la digitalización cruda
+  del shapefile. Corre en un hilo de fondo con barra de progreso real
+  (`RedPropiaCargaProgreso` + polling), porque puede tardar 1-2+ minutos en
+  redes grandes (el servidor público de OSRM solo acepta ~10 puntos por
+  consulta, así que se simplifica la geometría y se paralelizan las
+  consultas). La geometría original se guarda aparte (`lineas_originales_json`)
+  para poder comparar ambas capas en el mapa (activables por separado).
+- Resultado del mapa: degradado de color (verde→naranja) + flechas de
+  dirección para poder seguir el sentido del recorrido, todas las
+  distancias en km.
+- Tests nuevos en `core/tests/test_red_propia_cobertura.py` (callejones sin
+  salida, grafo ya-par, red fragmentada, nodo aislado, nodo inexistente,
+  emparejamiento con reintento de vecindario).
+
+## Actualización — 2026-07-29 (2)
+
+**Dockerización**
+- `Dockerfile` + `docker-compose.yml` — la app corre con `gunicorn` y sirve
+  estáticos con `whitenoise` (sin depender de nginx aparte para esto).
+  Probado de punta a punta: build, migraciones automáticas al arrancar
+  (`entrypoint.sh`), y respuesta HTTP 200 tanto en las páginas como en los
+  estáticos.
+- Sin sorpresas de dependencias binarias: `geopandas`/`osmnx`/`ortools`
+  instalaron con wheels prearmados en `python:3.13-slim`, sin necesitar
+  `libgdal-dev` del sistema.
+- `settings.py` ahora define `STATIC_ROOT` y usa
+  `whitenoise.storage.CompressedManifestStaticFilesStorage`.
 
 ## Actualización — 2026-07-28
 
@@ -170,10 +265,21 @@ Puntos/Camiones (una fila inválida rechaza el lote completo sin tocar lo que
 ya había). Corre sobre la base de datos de test que crea Django (en
 memoria) — nunca toca `db.sqlite3`.
 
+## Actualización — 2026-07-29
+
+**Migración a Postgres**
+- La base de datos pasó de SQLite a Postgres — los datos reales
+  (Puntos, Camiones, resultados guardados, etc.) se migraron sin pérdida
+  (`dumpdata`/`loaddata`, verificado registro por registro).
+- `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS` y las credenciales de la base ahora
+  se leen de un archivo `.env` (no versionado) en vez de estar hardcodeadas
+  — ver `.env.example` para el formato.
+
 ## Pendientes
 
-- Migrar de SQLite a Postgres para producción.
+- Desplegar en un servidor real (fuera de local) — Docker + VPS + Nginx/HTTPS.
 - Ampliar los tests de Django a más vistas (Calcular/Resultados, Costos,
   Red propia) — hoy solo cubren las validaciones de guardado.
 - Revisar diseño responsive / mobile.
 - Evaluar cálculo en background (Celery) si el volumen de datos crece.
+- Backups automáticos programados de Postgres.

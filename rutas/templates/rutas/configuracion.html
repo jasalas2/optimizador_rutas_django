@@ -48,6 +48,10 @@
         </div>
       </div>
 
+      <label for="tiempo_lavado">Tiempo de lavado del camión (min/día)</label>
+      <input type="number" id="tiempo_lavado" name="tiempo_lavado" min="0" max="120" value="{{ config.tiempo_lavado }}">
+      <div class="help">Se usa en el reporte por ruta, como horas de lavado al final de la jornada.</div>
+
       <label for="tope_horas_jornada">Máximo de horas por ruta</label>
       <input type="number" id="tope_horas_jornada" name="tope_horas_jornada" min="1" max="24" step="0.5" value="{{ config.tope_horas_jornada }}">
       <div class="help">No bloquea el cálculo: si un camión termina por encima de este tope, la ruta se
@@ -85,6 +89,26 @@
         <div>
           <label for="depot2_lon">Longitud</label>
           <input type="number" id="depot2_lon" name="depot2_lon" step="0.000001" value="{{ config.depot2_lon }}">
+        </div>
+      </div>
+
+      <hr class="div">
+      <h2 style="font-size:14px;">Relleno sanitario</h2>
+      <div class="caption">Parte de lo recolectado sale contaminado y no puede ir a Planta San Antonio —
+        se descuenta como porcentaje del peso diario. Las coordenadas son opcionales por ahora
+        (se usan más adelante para calcular la ruta hasta ahí).</div>
+
+      <label for="porcentaje_relleno">Porcentaje contaminado (%)</label>
+      <input type="number" id="porcentaje_relleno" name="porcentaje_relleno" min="0" max="100" step="0.1" value="{{ config.porcentaje_relleno }}">
+
+      <div class="fila-2">
+        <div>
+          <label for="relleno_lat">Latitud (opcional)</label>
+          <input type="number" id="relleno_lat" name="relleno_lat" step="0.000001" value="{{ config.relleno_lat|default_if_none:'' }}">
+        </div>
+        <div>
+          <label for="relleno_lon">Longitud (opcional)</label>
+          <input type="number" id="relleno_lon" name="relleno_lon" step="0.000001" value="{{ config.relleno_lon|default_if_none:'' }}">
         </div>
       </div>
 

@@ -1,9 +1,11 @@
 import io
 import json
 import math
+import threading
 import time
 from datetime import datetime as dt
 
+import geopandas as gpd
 import networkx as nx
 import pandas as pd
 from django.contrib import messages
@@ -13,13 +15,15 @@ from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
+from shapely.geometry import LineString
 
 from core.optimizador import (
     DIAS_SEMANA,
     TIPOS_VIA_DEFAULT,
+    ajustar_una_linea_con_osrm,
     bbox_de_camino,
+    calcular_recorrido_cobertura_total,
     calcular_rutas_para_puntos,
-    camino_geometria_red,
     clasificar_tramos_ruta,
     construir_grafo_red,
     construir_indice_vias,
@@ -28,6 +32,8 @@ from core.optimizador import (
     costo_diario_recurrente,
     descargar_red_osm_clasificada,
     dias_desde_ultima_recoleccion,
+    enganchar_a_red,
+    explotar_lineas_simples,
     exportar_geojson,
     exportar_gpx,
     exportar_kml,
@@ -36,7 +42,7 @@ from core.optimizador import (
     generar_links_google_maps,
     geocodificar_direccion,
     leer_capa_lineas,
-    matriz_distancias_red,
+    limpiar_lineas_con_osrm,
     obtener_ruta_completa_osrm_por_leg,
     peso_estimado_ruta_para_dia,
     reconstruir_viajes_desde_resumen,
@@ -50,6 +56,7 @@ from .models import (
     CostoRecurrente,
     CostosGenerales,
     Punto,
+    RedPropiaCargaProgreso,
     RedPropiaGrafo,
     RedPropiaPunto,
     RedPropiaResultado,
@@ -356,6 +363,8 @@ def configuracion_view(request):
                 messages.error(request, "El fin del almuerzo debe ser después del inicio.")
                 return render(request, "rutas/configuracion.html", {"config": config})
 
+        config.tiempo_lavado = _parsear_num(request.POST.get("tiempo_lavado"), config.tiempo_lavado, int)
+
         config.tope_horas_jornada = _parsear_num(request.POST.get("tope_horas_jornada"), config.tope_horas_jornada)
 
         config.velocidad_variable_via = request.POST.get("velocidad_variable_via") == "on"
@@ -366,6 +375,12 @@ def configuracion_view(request):
 
         config.depot2_lat = _parsear_num(request.POST.get("depot2_lat"), config.depot2_lat)
         config.depot2_lon = _parsear_num(request.POST.get("depot2_lon"), config.depot2_lon)
+
+        config.porcentaje_relleno = _parsear_num(request.POST.get("porcentaje_relleno"), config.porcentaje_relleno)
+        relleno_lat = request.POST.get("relleno_lat", "").strip()
+        relleno_lon = request.POST.get("relleno_lon", "").strip()
+        config.relleno_lat = _parsear_num(relleno_lat, None) if relleno_lat else None
+        config.relleno_lon = _parsear_num(relleno_lon, None) if relleno_lon else None
 
         errores = _errores_de_instancia(config, "Configuración")
         if errores:
@@ -527,11 +542,17 @@ def resultados_view(request):
     camiones_excedidos = []
     rutas_info = []
     if resultado:
+        config = ConfiguracionGeneral.cargar()
+        peso_total = sum(c["peso_total"] for c in resultado["camiones"])
+        peso_relleno = peso_total * config.porcentaje_relleno / 100
         metricas = {
             "camiones_usados": len(resultado["camiones"]),
             "dist_total_km": sum(c["dist_total_m"] for c in resultado["camiones"]) / 1000,
-            "peso_total": sum(c["peso_total"] for c in resultado["camiones"]),
+            "peso_total": peso_total,
             "hora_fin_max": max(c["hora_fin"] for c in resultado["camiones"]),
+            "porcentaje_relleno": config.porcentaje_relleno,
+            "peso_relleno": peso_relleno,
+            "peso_neto": peso_total - peso_relleno,
         }
         camiones_excedidos = [c for c in resultado["camiones"] if c.get("excede_jornada")]
 
@@ -557,6 +578,92 @@ def resultados_view(request):
         "dias_tabs": dias_tabs,
     }
     return render(request, "rutas/resultados.html", context)
+
+
+def _reporte_por_ruta(resultado, config):
+    """Arma, por cada camión/ruta ya calculada, los indicadores operativos
+    del reporte (identificación, distancias por tipo de tramo, y tiempos).
+
+    Distancias — se clasifica cada tramo del resumen según su tipo:
+    - "parada": la PRIMERA parada de cada viaje es aproximación (viene
+      vacío desde el plantel o desde el depot, tras la descarga anterior);
+      las paradas siguientes del mismo viaje son recolección.
+    - "descarga": tramo hasta la planta (cargado).
+    - "fin_jornada": tramo final de regreso al plantel (vacío).
+
+    Tiempos — no se re-derivan de los timestamps del resumen; se calculan
+    a partir de la distancia y de los mismos parámetros de Configuración
+    que ya usa el cálculo (velocidad, tiempo por parada, tiempo de
+    descarga, tiempo de lavado), para quedar consistentes con esos valores.
+    """
+    filas = []
+    for c in resultado["camiones"]:
+        camion_real = c.get("camion_real") or c["nombre"]
+        resumen = c["resumen"]
+
+        disponibilidad = CamionDisponibilidad.objects.filter(nombre_camion=camion_real).first()
+        dias_activos = [d.strip() for d in (disponibilidad.dias if disponibilidad else "").split(",") if d.strip()]
+        dias_por_semana = len(dias_activos) if dias_activos else 7
+        dias_operativos_anio = dias_por_semana * 52
+
+        n_paradas = sum(1 for f in resumen if f["tipo"] == "parada")
+
+        aproximacion_km = 0.0
+        recoleccion_km = 0.0
+        a_planta_km = 0.0
+        retorno_km = 0.0
+        primera_parada_vista = set()
+        for f in resumen:
+            dist_txt = f["Distancia tramo (km)"]
+            if dist_txt in ("-", None):
+                continue
+            dist = float(dist_txt)
+            if f["tipo"] == "parada":
+                if f["trip_idx"] not in primera_parada_vista:
+                    aproximacion_km += dist
+                    primera_parada_vista.add(f["trip_idx"])
+                else:
+                    recoleccion_km += dist
+            elif f["tipo"] == "descarga":
+                a_planta_km += dist
+            elif f["tipo"] == "fin_jornada":
+                retorno_km += dist
+
+        velocidad = config.velocidad_kmh or 1
+        distancia_total_km = aproximacion_km + recoleccion_km + a_planta_km + retorno_km
+
+        filas.append({
+            "nombre": c["nombre"],
+            "tipo_camion": camion_real,
+            "dias_operativos_anio": dias_operativos_anio,
+            "viajes_diarios": c["n_viajes_usados"],
+            "toneladas_dia": c["peso_total"] / 1000,
+            "aproximacion_km": aproximacion_km,
+            "recoleccion_km": recoleccion_km,
+            "a_planta_km": a_planta_km,
+            "retorno_km": retorno_km,
+            "horas_conduccion": distancia_total_km / velocidad,
+            "horas_recoleccion": n_paradas * config.tiempo_parada / 60,
+            "horas_descarga": c["n_viajes_usados"] * config.tiempo_descarga / 60,
+            "horas_lavado": config.tiempo_lavado / 60,
+        })
+    return filas
+
+
+def reporte_view(request):
+    dia_actual = _dia_actual_desde_request(request)
+    resultado_obj = ResultadoCalculo.cargar(dia_actual)
+    resultado = resultado_obj.resultado_json
+    dias_tabs = _construir_dias_tabs()
+    config = ConfiguracionGeneral.cargar()
+
+    context = {
+        "resultado": resultado,
+        "dia_actual": dia_actual,
+        "dias_tabs": dias_tabs,
+        "filas_reporte": _reporte_por_ruta(resultado, config) if resultado else [],
+    }
+    return render(request, "rutas/reporte.html", context)
 
 
 def _redirect_calcular(dia):
@@ -773,6 +880,7 @@ def api_ejecutar_calculo(request):
         for grupo_key, resultado_grupo in resultados_grupos.items():
             for c in resultado_grupo["camiones"]:
                 c_zona = dict(c)
+                c_zona["camion_real"] = c["nombre"]  # nombre crudo, sin el prefijo de zona
                 c_zona["nombre"] = f"{grupo_key} — {c['nombre']}"
                 camiones_combinados.append(c_zona)
             for err in resultado_grupo["errores_osrm"]:
@@ -1138,15 +1246,81 @@ def red_propia_view(request):
     G, nodos, info = _grafo_desde_bd()
     puntos = RedPropiaPunto.objects.all()
     resultado = RedPropiaResultado.cargar().resultado_json
+    progreso = RedPropiaCargaProgreso.cargar()
 
     context = {
         "tiene_grafo": G is not None,
         "info": info,
+        "progreso": progreso,
         "puntos_json": json.dumps([_red_propia_punto_to_row(p) for p in puntos]),
+        "lineas_originales_json": json.dumps(info.lineas_originales_json) if info and info.lineas_originales_json else "null",
         "resultado": resultado,
         "resultado_json": json.dumps(resultado) if resultado else "null",
     }
     return render(request, "rutas/red_propia.html", context)
+
+
+def _cargar_red_en_segundo_plano(lineas_simples, tolerancia_m):
+    """
+    Corre en un hilo aparte (lanzado desde api_red_propia_cargar) -- el
+    ajuste a OSRM de una red real (decenas de líneas, varias consultas cada
+    una) puede tardar minutos, y no tiene sentido dejar al navegador
+    esperando una sola petición HTTP sin ninguna señal de que sigue viva.
+    En vez de eso, esta función va actualizando RedPropiaCargaProgreso línea
+    por línea, y el navegador consulta ese estado (api_red_propia_progreso)
+    para dibujar una barra de progreso real.
+    """
+    from django.db import connection
+
+    progreso = RedPropiaCargaProgreso.cargar()
+    try:
+        lineas_originales = [list(g.coords) for g in lineas_simples]
+        lineas_ajustadas = []
+        n_ajustadas = 0
+        for i, geom in enumerate(lineas_simples):
+            coords, se_ajusto = ajustar_una_linea_con_osrm(geom)
+            lineas_ajustadas.append(coords)
+            if se_ajusto:
+                n_ajustadas += 1
+            progreso.lineas_hechas = i + 1
+            progreso.mensaje = f"Ajustando líneas a calles reales (OSM)... {i + 1}/{len(lineas_simples)}"
+            progreso.save()
+
+        geoms_ajustadas = [LineString(c) if len(c) >= 2 else None for c in lineas_ajustadas]
+        gdf_ajustado = gpd.GeoDataFrame(geometry=geoms_ajustadas)
+
+        G, nodos = construir_grafo_red(gdf_ajustado, tolerancia_m=tolerancia_m)
+        componentes = contar_componentes_red(G)
+
+        info = RedPropiaGrafo.cargar()
+        info.nodos_json = [list(n) for n in nodos]
+        info.aristas_json = [[a, b, d["weight"]] for a, b, d in G.edges(data=True)]
+        info.n_lineas = len(lineas_simples)
+        info.n_componentes = len(componentes)
+        info.tamano_componentes_json = sorted((len(c) for c in componentes), reverse=True)
+        info.lineas_originales_json = [[list(p) for p in linea] for linea in lineas_originales]
+        info.n_lineas_ajustadas = n_ajustadas
+        info.save()
+
+        resultado_obj = RedPropiaResultado.cargar()
+        resultado_obj.resultado_json = None
+        resultado_obj.save()
+
+        if n_ajustadas < len(lineas_simples):
+            progreso.mensaje = (
+                f"Red cargada. {n_ajustadas} de {len(lineas_simples)} líneas se ajustaron a "
+                "calles reales (OSM); el resto quedó con la geometría original del archivo "
+                "(OSRM no pudo emparejarlas)."
+            )
+        else:
+            progreso.mensaje = "Red cargada y ajustada a calles reales (OSM)."
+        progreso.error = ""
+    except Exception as e:
+        progreso.error = f"Error cargando la red: {e}"
+    finally:
+        progreso.en_progreso = False
+        progreso.save()
+        connection.close()
 
 
 @require_POST
@@ -1163,22 +1337,43 @@ def api_red_propia_cargar(request):
         messages.error(request, error_lectura)
         return redirect("rutas:red_propia")
 
-    G, nodos = construir_grafo_red(gdf_lineas, tolerancia_m=tolerancia_m)
-    componentes = contar_componentes_red(G)
+    # Separa cada MultiLineString del shapefile en líneas simples -- shapely
+    # no deja pedir .coords sobre una geometría multi-parte directamente.
+    lineas_simples = explotar_lineas_simples(gdf_lineas)
+    if not lineas_simples:
+        messages.error(request, "El archivo no tiene líneas válidas.")
+        return redirect("rutas:red_propia")
 
-    info = RedPropiaGrafo.cargar()
-    info.nodos_json = [list(n) for n in nodos]
-    info.aristas_json = [[a, b, d["weight"]] for a, b, d in G.edges(data=True)]
-    info.n_lineas = len(gdf_lineas)
-    info.n_componentes = len(componentes)
-    info.tamano_componentes_json = sorted((len(c) for c in componentes), reverse=True)
-    info.save()
+    # El ajuste a OSRM se hace en un hilo de fondo (ver
+    # _cargar_red_en_segundo_plano) -- acá solo se deja todo listo (archivo
+    # ya leído en memoria, nada que dependa de la petición HTTP en curso) y
+    # se redirige de inmediato; la pantalla muestra una barra de progreso
+    # que consulta el estado sola.
+    progreso = RedPropiaCargaProgreso.cargar()
+    progreso.en_progreso = True
+    progreso.lineas_total = len(lineas_simples)
+    progreso.lineas_hechas = 0
+    progreso.mensaje = "Ajustando líneas a calles reales (OSM)..."
+    progreso.error = ""
+    progreso.save()
 
-    RedPropiaResultado.cargar().resultado_json = None
-    RedPropiaResultado.cargar().save()
+    hilo = threading.Thread(
+        target=_cargar_red_en_segundo_plano, args=(lineas_simples, tolerancia_m), daemon=True,
+    )
+    hilo.start()
 
-    messages.success(request, "Red cargada.")
     return redirect("rutas:red_propia")
+
+
+def api_red_propia_progreso(request):
+    p = RedPropiaCargaProgreso.cargar()
+    return JsonResponse({
+        "en_progreso": p.en_progreso,
+        "lineas_total": p.lineas_total,
+        "lineas_hechas": p.lineas_hechas,
+        "mensaje": p.mensaje,
+        "error": p.error,
+    })
 
 
 @require_POST
@@ -1205,56 +1400,45 @@ def api_red_propia_guardar_puntos(request):
 
 @require_POST
 def api_red_propia_calcular(request):
+    """Calcula un recorrido que cubre TODA la red cargada (Problema del
+    Cartero Chino / Route Inspection), no la mejor ruta entre puntos
+    elegidos -- ver core.optimizador.calcular_recorrido_cobertura_total.
+    El primer punto guardado en RedPropiaPunto se usa como inicio/fin del
+    circuito (recorrido siempre cerrado)."""
     G, nodos, info = _grafo_desde_bd()
     if G is None:
         messages.error(request, "Cargá una red primero.")
         return redirect("rutas:red_propia")
 
-    puntos_validos = list(RedPropiaPunto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True))
-    if len(puntos_validos) < 2:
-        messages.error(request, "Necesitás al menos 2 puntos con coordenadas.")
+    punto_inicio = RedPropiaPunto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True).first()
+    if punto_inicio is None:
+        messages.error(request, "Necesitás guardar un punto de inicio con coordenadas.")
         return redirect("rutas:red_propia")
 
-    puntos_lonlat = [(p.longitud, p.latitud) for p in puntos_validos]
-    nombres_red = [p.nombre for p in puntos_validos]
-
-    matriz, nodos_enganchados, enganches, pares_sin_red = matriz_distancias_red(puntos_lonlat, G, nodos)
-    # matriz_distancias_red da distancias float (Dijkstra sobre la red); resolver_vrp
-    # (OR-Tools) necesita costos de arco enteros, igual que la matriz de OSRM que usa
-    # normalmente -- se redondea acá nada más, sin tocar la lógica de core/.
-    matriz_int = [[int(round(v)) for v in fila] for fila in matriz]
-    demandas_red = [0] * len(puntos_lonlat)
-    rutas_red = resolver_vrp(matriz_int, demandas_red, [10**9], start_nodes=[0], end_node=0)
-
-    if rutas_red is None or not rutas_red[0]:
-        messages.error(request, "No se pudo calcular una ruta con estos puntos.")
+    nodo_inicio, dist_enganche_m = enganchar_a_red((punto_inicio.longitud, punto_inicio.latitud), nodos)
+    resultado_cobertura = calcular_recorrido_cobertura_total(G, nodo_inicio)
+    if resultado_cobertura is None:
+        messages.error(request, "No se pudo calcular un recorrido con esta red.")
         return redirect("rutas:red_propia")
 
-    orden_nodos = rutas_red[0][0]
-    camino_completo = []
-    dist_total_m = 0.0
-    for a, b in zip(orden_nodos, orden_nodos[1:]):
-        tramo = camino_geometria_red(G, nodos, nodos_enganchados[a], nodos_enganchados[b])
-        camino_completo.extend(tramo if not camino_completo else tramo[1:])
-        dist_total_m += matriz[a][b]
-
-    distancias_enganche = [enganches[i][1] for i in range(len(enganches))]
+    camino = [list(nodos[n]) for n in resultado_cobertura["ruta_nodos"]]
 
     resultado = {
-        "orden_nodos": orden_nodos,
-        "nombres": [nombres_red[i] for i in orden_nodos],
-        "puntos_lonlat": puntos_lonlat,
-        "camino": camino_completo,
-        "dist_total_m": dist_total_m,
-        "pares_sin_red": [[nombres_red[i], nombres_red[j]] for i, j in pares_sin_red],
-        "distancias_enganche": distancias_enganche,
-        "nombres_todos": nombres_red,
+        "nombre_inicio": punto_inicio.nombre,
+        "punto_inicio_lonlat": [punto_inicio.longitud, punto_inicio.latitud],
+        "distancia_enganche_km": dist_enganche_m / 1000,
+        "camino": camino,
+        "distancia_original_km": resultado_cobertura["distancia_original_m"] / 1000,
+        "distancia_repetida_km": resultado_cobertura["distancia_repetida_m"] / 1000,
+        "distancia_total_km": resultado_cobertura["distancia_total_m"] / 1000,
+        "componente_size": resultado_cobertura["componente_size"],
+        "nodos_excluidos": resultado_cobertura["nodos_excluidos"],
     }
     resultado_obj = RedPropiaResultado.cargar()
     resultado_obj.resultado_json = resultado
     resultado_obj.save()
 
-    messages.success(request, "Ruta calculada.")
+    messages.success(request, "Recorrido de cobertura total calculado.")
     return redirect("rutas:red_propia")
 
 

@@ -29,6 +29,18 @@ class ConfiguracionGeneral(models.Model):
     depot2_lat = models.FloatField(default=9.964356, validators=LAT_VALIDATORS)
     depot2_lon = models.FloatField(default=-84.161528, validators=LON_VALIDATORS)
 
+    tiempo_lavado = models.PositiveIntegerField(
+        default=20, validators=[MinValueValidator(0), MaxValueValidator(120)],
+        help_text="Minutos de lavado del camión al final de la jornada.",
+    )
+
+    porcentaje_relleno = models.FloatField(
+        default=5.0, validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="% del peso diario que sale contaminado y va a relleno sanitario en vez de a Planta San Antonio.",
+    )
+    relleno_lat = models.FloatField(null=True, blank=True, validators=LAT_VALIDATORS)
+    relleno_lon = models.FloatField(null=True, blank=True, validators=LON_VALIDATORS)
+
     @classmethod
     def cargar(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
@@ -164,6 +176,46 @@ class RedPropiaGrafo(models.Model):
     n_lineas = models.IntegerField(default=0)
     n_componentes = models.IntegerField(default=0)
     tamano_componentes_json = models.JSONField(default=list, blank=True)
+
+    # Geometría CRUDA tal como venía el shapefile subido (antes de ajustarla
+    # a calles reales vía OSRM) -- se guarda aparte solo para poder
+    # mostrarla de referencia en el mapa ("capa importada"); el grafo de
+    # arriba (nodos_json/aristas_json) ya es el AJUSTADO, el que se usa
+    # para calcular cualquier recorrido.
+    lineas_originales_json = models.JSONField(null=True, blank=True)
+    n_lineas_ajustadas = models.IntegerField(default=0)
+
+    @classmethod
+    def cargar(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+
+class RedPropiaCargaProgreso(models.Model):
+    """Fila única (singleton, siempre pk=1) -- estado del ajuste a OSRM que
+    corre en un hilo de fondo al cargar una red (ver
+    rutas.views._cargar_red_en_segundo_plano). El navegador consulta este
+    estado cada 1s (api_red_propia_progreso) para dibujar una barra de
+    progreso real, en vez de dejar al usuario esperando una petición HTTP
+    sin ninguna señal de que sigue viva."""
+    en_progreso = models.BooleanField(default=False)
+    lineas_total = models.IntegerField(default=0)
+    lineas_hechas = models.IntegerField(default=0)
+    mensaje = models.CharField(max_length=300, blank=True, default="")
+    error = models.CharField(max_length=500, blank=True, default="")
+
+    @classmethod
+    def cargar(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
 
     @classmethod
     def cargar(cls):

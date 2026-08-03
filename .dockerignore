@@ -1,10 +1,12 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+cache/
+staticfiles/
 db.sqlite3
 db.sqlite3.backup*
 backup_datos_reales.json
 .env
-.pytest_cache/
-cache/
-staticfiles/
+.git/
+.gitignore

@@ -1,4 +1,8 @@
 Django>=6.0
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+gunicorn>=22.0
+whitenoise>=6.6
 ortools>=9.7
 requests>=2.31
 pandas>=2.0
@@ -7,3 +11,4 @@ geopandas>=1.0
 shapely>=2.0
 networkx>=3.0
 osmnx>=2.0
+scipy>=1.14
