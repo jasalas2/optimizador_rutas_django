@@ -666,6 +666,103 @@ def reporte_view(request):
     return render(request, "rutas/reporte.html", context)
 
 
+def _resumen_calculo(resultado):
+    """Métricas agregadas de un resultado de calcular_rutas_para_puntos --
+    usado tanto por el simulador (líneas base y simulada) como se podría
+    reusar en cualquier otro lado que solo necesite el resumen, no el detalle
+    completo por camión."""
+    peso_total = sum(c["peso_total"] for c in resultado["camiones"])
+    return {
+        "camiones_usados": len(resultado["camiones"]),
+        "dist_total_km": sum(c["dist_total_m"] for c in resultado["camiones"]) / 1000,
+        "peso_total": peso_total,
+        "hora_fin_max": max(c["hora_fin"] for c in resultado["camiones"]),
+        "camiones_excedidos": sum(1 for c in resultado["camiones"] if c.get("excede_jornada")),
+    }
+
+
+def _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_pct):
+    """Corre calcular_rutas_para_puntos con la flota/puntos actuales pero
+    MODIFICADOS en memoria (nunca se guarda nada) -- para el Simulador
+    "¿qué pasa si...?". Reusa la misma lógica que Calcular ("Todos los
+    puntos juntos"), sin tocar core/optimizador.py."""
+    config = ConfiguracionGeneral.cargar()
+
+    tabla_puntos = _puntos_dataframe().dropna(subset=["Latitud", "Longitud"]).copy()
+    if len(tabla_puntos) < 1:
+        return None, "Necesitás al menos 1 punto con coordenadas."
+    tabla_puntos["Peso (kg)"] = tabla_puntos["Peso (kg)"] * (1 + cambio_peso_pct / 100)
+
+    tabla_camiones = _camiones_dataframe().dropna(subset=["Nombre", "Capacidad (kg)"]).copy()
+    if camiones_excluidos:
+        tabla_camiones = tabla_camiones[~tabla_camiones["Nombre"].isin(camiones_excluidos)]
+
+    if camiones_extra > 0:
+        base = _camiones_dataframe().dropna(subset=["Nombre", "Capacidad (kg)"])
+        if len(base) > 0:
+            cap_prom = base["Capacidad (kg)"].mean()
+            personas_prom = max(1, round(base["Personas"].mean()))
+            viajes_prom = max(1, round(base["Viajes máx."].mean()))
+            lat_prom = base["Plantel Lat"].dropna().mean()
+            lon_prom = base["Plantel Lon"].dropna().mean()
+            filas_extra = [{
+                "Nombre": f"Camión simulado {i + 1}", "Capacidad (kg)": cap_prom,
+                "Personas": personas_prom, "Viajes máx.": viajes_prom,
+                "Plantel Lat": lat_prom, "Plantel Lon": lon_prom,
+                "Cantón asignado": "", "Distrito asignado": "",
+            } for i in range(camiones_extra)]
+            tabla_camiones = pd.concat([tabla_camiones, pd.DataFrame(filas_extra)], ignore_index=True)
+
+    tabla_camiones = tabla_camiones.dropna(subset=["Plantel Lat", "Plantel Lon"])
+    if len(tabla_camiones) < 1:
+        return None, "Necesitás al menos 1 camión activo (con plantel) en la simulación."
+
+    kwargs_comunes = dict(
+        depot2_lat=config.depot2_lat, depot2_lon=config.depot2_lon,
+        hora_inicio=config.hora_inicio, velocidad_kmh=config.velocidad_kmh,
+        tiempo_parada=config.tiempo_parada, balancear=config.balancear,
+        velocidad_variable_via=config.velocidad_variable_via,
+        velocidad_rapida_kmh=config.velocidad_rapida_kmh,
+        tiempo_descarga=config.tiempo_descarga,
+        hora_almuerzo_inicio=config.hora_almuerzo_inicio if config.usar_almuerzo else None,
+        hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
+        tope_horas_jornada=config.tope_horas_jornada,
+    )
+    resultado, error = calcular_rutas_para_puntos(tabla_puntos, tabla_camiones, **kwargs_comunes)
+    if error:
+        return None, error
+    return _resumen_calculo(resultado), None
+
+
+def simulador_view(request):
+    camiones = list(Camion.objects.all())
+    tiene_datos = Punto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True).exists() and camiones
+    resumen_actual, error_actual = (_ejecutar_calculo_simulado([], 0, 0) if tiene_datos else (None, None))
+    context = {
+        "camiones": camiones,
+        "tiene_datos": tiene_datos,
+        "resumen_actual": resumen_actual,
+        "error_actual": error_actual,
+    }
+    return render(request, "rutas/simulador.html", context)
+
+
+@require_POST
+def api_simulador_calcular(request):
+    data = json.loads(request.body)
+    camiones_excluidos = data.get("camiones_excluidos", [])
+    try:
+        camiones_extra = max(0, min(10, int(data.get("camiones_extra", 0))))
+        cambio_peso_pct = max(-90, min(300, float(data.get("cambio_peso_pct", 0))))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Parámetros inválidos."}, status=400)
+
+    resumen, error = _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_pct)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+    return JsonResponse(resumen)
+
+
 def _redirect_calcular(dia):
     url = reverse("rutas:calcular")
     return redirect(f"{url}?dia={dia}" if dia else url)

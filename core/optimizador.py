@@ -7,6 +7,7 @@ st.* y session_state. Cualquier cambio a este modulo debe seguir
 pasando core/tests/test_modelo_tiempo.py.
 """
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -341,6 +342,15 @@ def resolver_vrp(distancias, demandas, capacidades, start_nodes, end_node,
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     n_nodos = len(distancias)
     params.time_limit.seconds = max(10, min(90, n_nodos * max(vm_list) * 2))
+    # Guided Local Search en sí es determinístico (mismos datos -> misma
+    # secuencia de movimientos), pero SOLO time_limit como criterio de
+    # parada no lo es: cuántas iteraciones alcanza a hacer en N segundos de
+    # reloj real depende de qué tan cargada esté la máquina en ese momento
+    # -- por eso el mismo cálculo, corrido dos veces, podía dar un resultado
+    # distinto. solution_limit para en una cantidad FIJA de soluciones
+    # mejoradas encontradas, sin depender del reloj -- mismos datos, mismo
+    # resultado siempre. time_limit queda como techo de seguridad nada más.
+    params.solution_limit = 100
 
     sol = routing.SolveWithParameters(params)
     if not sol:
@@ -588,15 +598,16 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
                          viajes_max=VIAJES_MAX_CAM)
 
     # ── Velocidad variable por tipo de vía (opcional) ──
-    # Se descarga UNA sola vez para todo este grupo de puntos, antes de
-    # procesar los viajes. Si falla (sin internet, Overpass caído, etc.),
-    # se apaga sola y el cálculo sigue igual que si estuviera desactivada.
+    # Se descarga (o se reusa del caché, ver descargar_red_osm_clasificada_cacheada)
+    # UNA sola vez para todo este grupo de puntos, antes de procesar los
+    # viajes. Si falla (sin internet, Overpass caído, etc.), se apaga sola y
+    # el cálculo sigue igual que si estuviera desactivada.
     arbol_via, tipos_via_clasif = None, None
     errores_osrm_previos = []
     if velocidad_variable_via:
         try:
             bbox_grupo = bbox_de_camino(LOCATIONS)
-            gdf_vias_calc = descargar_red_osm_clasificada(bbox_grupo)
+            gdf_vias_calc = descargar_red_osm_clasificada_cacheada(bbox_grupo)
             arbol_via, tipos_via_clasif = construir_indice_vias(gdf_vias_calc)
         except Exception as e:
             errores_osrm_previos.append(
@@ -1192,6 +1203,37 @@ def descargar_red_osm_clasificada(bbox, network_type="drive"):
     gdf_edges = gdf_edges.reset_index()
     gdf_edges["highway"] = gdf_edges["highway"].apply(_normalizar_highway)
     return gdf_edges[["highway", "geometry"]]
+
+
+# Caché en memoria (por proceso) de la red vial ya clasificada, para no
+# volver a descargarla de OSM/Overpass en cada cálculo cuando está activa
+# "velocidad variable por tipo de vía" -- la descarga puede tardar varios
+# minutos (Overpass parte el área en muchas sub-consultas si es grande), y
+# la red vial real cambia muy poco día a día. Vive en un dict simple (no
+# Django cache) para que este módulo siga sin depender de Django.
+_CACHE_RED_OSM = {}
+_CACHE_RED_OSM_TTL_S = 24 * 3600  # 24 horas
+
+
+def _bbox_redondeado(bbox, decimales=3):
+    """~110m de grilla en el ecuador -- suficiente para que corridas con los
+    mismos puntos (o casi) reusen la misma entrada de caché."""
+    return tuple(round(v, decimales) for v in bbox)
+
+
+def descargar_red_osm_clasificada_cacheada(bbox, network_type="drive"):
+    """Igual que descargar_red_osm_clasificada, pero reusa el resultado si ya
+    se descargó ese mismo bbox (redondeado) hace menos de _CACHE_RED_OSM_TTL_S.
+    Si la descarga falla, NO se guarda nada en caché (para reintentar la
+    próxima vez, en vez de quedar pegado a un fallo)."""
+    clave = (_bbox_redondeado(bbox), network_type)
+    ahora = time.time()
+    entrada = _CACHE_RED_OSM.get(clave)
+    if entrada is not None and (ahora - entrada[0]) < _CACHE_RED_OSM_TTL_S:
+        return entrada[1]
+    gdf = descargar_red_osm_clasificada(bbox, network_type=network_type)
+    _CACHE_RED_OSM[clave] = (ahora, gdf)
+    return gdf
 
 
 def construir_indice_vias(gdf_vias):

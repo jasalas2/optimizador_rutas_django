@@ -1,0 +1,198 @@
+{% extends "rutas/_base.html" %}
+{% block title %}Simulador — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<style>
+  .sim-flota { display: flex; flex-direction: column; gap: 8px; }
+  .sim-camion-chk {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+  }
+  .sim-camion-chk .nombre { font-weight: 700; flex: 1; }
+  .sim-camion-chk .cap { color: var(--text-muted); font-size: 12px; }
+  .sim-stepper { display: flex; align-items: center; gap: 10px; }
+  .sim-stepper button {
+    width: 30px; height: 30px; border-radius: 8px; border: 1.5px solid var(--border);
+    background: var(--surface); color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer;
+  }
+  .sim-stepper .valor { font-weight: 800; font-size: 16px; min-width: 20px; text-align: center; }
+  .sim-slider-row { display: flex; flex-direction: column; gap: 6px; }
+  .sim-slider-row input[type="range"] { width: 100%; }
+  .sim-slider-valor { font-weight: 800; font-size: 20px; }
+  .sim-slider-valor.pos { color: var(--warning); }
+  .sim-slider-valor.neg { color: var(--accent-strong); }
+  .sim-comparacion { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .sim-col { padding: 16px 20px; }
+  .sim-col + .sim-col { border-left: 1px solid var(--border); }
+  .sim-col h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); margin-bottom: 12px; }
+  .sim-fila { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+  .sim-fila:last-child { border-bottom: none; }
+  .sim-fila .val { font-weight: 800; font-variant-numeric: tabular-nums; }
+  .sim-delta { font-size: 11.5px; margin-left: 6px; font-weight: 700; }
+  .sim-delta.mejor { color: var(--accent-strong); }
+  .sim-delta.peor { color: var(--danger); }
+  .sim-delta.neutro { color: var(--text-faint); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Simulador <span class="chip" style="vertical-align:middle;">¿Qué pasa si...?</span></h1>
+    <div class="sub">
+      Probá cambios en la flota o en el volumen de recolección y mirá el impacto en vivo, sin guardar
+      nada -- para comparar escenarios antes de decidir. Usa tus Puntos y Camiones actuales, modo
+      "Todos los puntos juntos".
+    </div>
+  </div>
+</div>
+
+{% if not tiene_datos %}
+  <div class="msg info">
+    Necesitás al menos 1 Punto con coordenadas y 1 Camión para poder simular.
+    <a href="{% url 'rutas:puntos' %}" style="font-weight:700;">Ir a Puntos →</a>
+  </div>
+{% else %}
+  <div class="card">
+    <div class="card-head"><h2>1. Flota</h2></div>
+    <div class="card-body">
+      <p class="caption" style="margin-top:0;">Desmarcá un camión para simular perderlo. Sumá camiones simulados
+        (con la capacidad promedio de tu flota) para simular reforzarla.</p>
+      <div class="sim-flota" id="sim-flota">
+        {% for c in camiones %}
+          <label class="sim-camion-chk">
+            <input type="checkbox" class="sim-chk-camion" value="{{ c.nombre }}" checked>
+            <span class="nombre">{{ c.nombre }}</span>
+            <span class="cap">{{ c.capacidad_kg|floatformat:0 }} kg · {{ c.viajes_max }} viaje{{ c.viajes_max|pluralize }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <div class="sim-stepper" style="margin-top:14px;">
+        <span style="font-size:13px;">+ Camiones simulados:</span>
+        <button type="button" id="sim-camion-menos">−</button>
+        <span class="valor" id="sim-camion-valor">0</span>
+        <button type="button" id="sim-camion-mas">+</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>2. Volumen de recolección</h2></div>
+    <div class="card-body">
+      <div class="sim-slider-row">
+        <span class="sim-slider-valor" id="sim-peso-valor">+0%</span>
+        <input type="range" id="sim-peso-slider" min="-90" max="300" step="5" value="0">
+        <p class="caption" style="margin:0;">Escala el peso de TODOS los puntos actuales por este porcentaje --
+          para simular que el volumen de basura crece o baja, sin inventar direcciones nuevas.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card-body" style="border:none;padding:0 0 18px;">
+    <button class="btn primary" type="button" id="sim-btn-simular" style="width:100%;padding:14px;font-size:14.5px;">▶ Simular</button>
+    <p class="caption" id="sim-estado" style="text-align:center;margin-top:8px;"></p>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>3. Comparación</h2></div>
+    <div class="sim-comparacion">
+      <div class="sim-col">
+        <h3>Actual</h3>
+        {% if resumen_actual %}
+          <div class="sim-fila"><span>Camiones usados</span><span class="val">{{ resumen_actual.camiones_usados }}</span></div>
+          <div class="sim-fila"><span>Distancia total</span><span class="val">{{ resumen_actual.dist_total_km|floatformat:1 }} km</span></div>
+          <div class="sim-fila"><span>Peso total</span><span class="val">{{ resumen_actual.peso_total|floatformat:0 }} kg</span></div>
+          <div class="sim-fila"><span>Fin estimado</span><span class="val">{{ resumen_actual.hora_fin_max }}</span></div>
+          <div class="sim-fila"><span>Camiones sobre jornada</span><span class="val">{{ resumen_actual.camiones_excedidos }}</span></div>
+        {% else %}
+          <p class="caption">{{ error_actual|default:"No se pudo calcular el escenario actual." }}</p>
+        {% endif %}
+      </div>
+      <div class="sim-col">
+        <h3>Simulado</h3>
+        <div id="sim-resultado">
+          <p class="caption">Ajustá los controles de arriba y tocá "Simular".</p>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+{% if tiene_datos %}
+<script>
+const resumenActual = {{ resumen_actual|default:"null"|safe }};
+let camionesExtra = 0;
+
+const valorCamiones = document.getElementById("sim-camion-valor");
+document.getElementById("sim-camion-mas").addEventListener("click", () => {
+  camionesExtra = Math.min(10, camionesExtra + 1);
+  valorCamiones.textContent = camionesExtra;
+});
+document.getElementById("sim-camion-menos").addEventListener("click", () => {
+  camionesExtra = Math.max(0, camionesExtra - 1);
+  valorCamiones.textContent = camionesExtra;
+});
+
+const sliderPeso = document.getElementById("sim-peso-slider");
+const valorPeso = document.getElementById("sim-peso-valor");
+function actualizarValorPeso() {
+  const v = parseInt(sliderPeso.value, 10);
+  valorPeso.textContent = (v > 0 ? "+" : "") + v + "%";
+  valorPeso.className = "sim-slider-valor " + (v > 0 ? "pos" : v < 0 ? "neg" : "");
+}
+sliderPeso.addEventListener("input", actualizarValorPeso);
+actualizarValorPeso();
+
+function deltaHtml(actual, simulado, mejorSiBaja) {
+  if (actual === null || actual === undefined) return "";
+  const diff = simulado - actual;
+  if (Math.abs(diff) < 0.05) return `<span class="sim-delta neutro">sin cambio</span>`;
+  const mejora = mejorSiBaja ? diff < 0 : diff > 0;
+  const signo = diff > 0 ? "+" : "";
+  return `<span class="sim-delta ${mejora ? "mejor" : "peor"}">${signo}${diff.toFixed(1)}</span>`;
+}
+
+const btnSimular = document.getElementById("sim-btn-simular");
+const estadoDiv = document.getElementById("sim-estado");
+const resultadoDiv = document.getElementById("sim-resultado");
+
+btnSimular.addEventListener("click", async () => {
+  btnSimular.disabled = true;
+  btnSimular.textContent = "Simulando...";
+  estadoDiv.textContent = "";
+  const camionesExcluidos = Array.from(document.querySelectorAll(".sim-chk-camion"))
+    .filter(chk => !chk.checked)
+    .map(chk => chk.value);
+  try {
+    const resp = await fetch("{% url 'rutas:api_simulador_calcular' %}", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-CSRFToken": getCookie("csrftoken")},
+      body: JSON.stringify({
+        camiones_excluidos: camionesExcluidos,
+        camiones_extra: camionesExtra,
+        cambio_peso_pct: parseInt(sliderPeso.value, 10),
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      resultadoDiv.innerHTML = `<p class="caption" style="color:var(--danger);">${data.error || "No se pudo simular."}</p>`;
+      return;
+    }
+    resultadoDiv.innerHTML = `
+      <div class="sim-fila"><span>Camiones usados</span><span class="val">${data.camiones_usados}${resumenActual ? deltaHtml(resumenActual.camiones_usados, data.camiones_usados, false) : ""}</span></div>
+      <div class="sim-fila"><span>Distancia total</span><span class="val">${data.dist_total_km.toFixed(1)} km${resumenActual ? deltaHtml(resumenActual.dist_total_km, data.dist_total_km, true) : ""}</span></div>
+      <div class="sim-fila"><span>Peso total</span><span class="val">${Math.round(data.peso_total).toLocaleString("es-CR")} kg</span></div>
+      <div class="sim-fila"><span>Fin estimado</span><span class="val">${data.hora_fin_max}</span></div>
+      <div class="sim-fila"><span>Camiones sobre jornada</span><span class="val">${data.camiones_excedidos}${resumenActual ? deltaHtml(resumenActual.camiones_excedidos, data.camiones_excedidos, true) : ""}</span></div>
+    `;
+  } catch (e) {
+    resultadoDiv.innerHTML = `<p class="caption" style="color:var(--danger);">Error: ${e.message}</p>`;
+  } finally {
+    btnSimular.disabled = false;
+    btnSimular.textContent = "▶ Simular";
+  }
+});
+</script>
+{% endif %}
+{% endblock %}

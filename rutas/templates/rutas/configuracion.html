@@ -62,8 +62,9 @@
         <label for="velocidad_variable_via">Velocidad más rápida en autopista/vía troncal</label>
       </div>
       <div class="help">Si está activo, los tramos clasificados como autopista o vía troncal (OpenStreetMap)
-        usan una velocidad más alta que el resto — más realista, pero necesita internet y hace el cálculo un
-        poco más lento.</div>
+        usan una velocidad más alta que el resto — más realista, pero necesita internet. La primera vez que
+        se calcula (o si pasaron más de 24h) puede tardar varios minutos, porque descarga la red vial completa
+        de la zona; los cálculos siguientes reusan esa descarga y son rápidos otra vez.</div>
       <div id="campos-via" style="margin-left:1.2rem;border-left:2px solid var(--border);padding-left:1rem;" {% if not config.velocidad_variable_via %}hidden{% endif %}>
         <label for="velocidad_rapida_kmh">Velocidad en autopista/troncal (km/h)</label>
         <input type="number" id="velocidad_rapida_kmh" name="velocidad_rapida_kmh" min="10" max="150" value="{{ config.velocidad_rapida_kmh }}">
