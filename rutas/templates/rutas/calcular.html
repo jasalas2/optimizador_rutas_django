@@ -23,8 +23,9 @@
   .camion-chip {
     display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 8px;
     border-radius: 20px; border: 1.5px solid var(--border-strong); font-size: 12.5px; font-weight: 600;
-    background: var(--surface);
+    background: var(--surface); cursor: pointer; font-family: var(--sans); color: var(--text);
   }
+  .camion-chip:disabled { cursor: wait; opacity: .7; }
   .camion-chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-strong); flex-shrink: 0; }
   .camion-chip.excluido { opacity: .5; text-decoration: line-through; }
   .camion-chip.excluido .dot { background: var(--text-faint); }
@@ -45,13 +46,13 @@
     {% include "rutas/_dias_tabs.html" %}
 
     {% if dia_actual %}
-      <div class="caption" style="margin-top:18px;margin-bottom:6px;">Camiones disponibles el <b>{{ dia_actual }}</b> (definido en Camiones → "Días disponibles"):</div>
-      <div class="flota-chips">
+      <div class="caption" style="margin-top:18px;margin-bottom:6px;">Camiones disponibles el <b>{{ dia_actual }}</b> — tocá uno para activarlo/desactivarlo ese día (se guarda igual que en Camiones → "Días disponibles"):</div>
+      <div class="flota-chips" id="flota-chips" data-dia="{{ dia_actual }}">
         {% for c in camiones_disponibilidad %}
-          <span class="camion-chip {% if not c.disponible %}excluido{% endif %}"><span class="dot"></span>{{ c.nombre }}</span>
+          <button type="button" class="camion-chip {% if not c.disponible %}excluido{% endif %}" data-nombre="{{ c.nombre }}"><span class="dot"></span>{{ c.nombre }}</button>
         {% endfor %}
       </div>
-      <div class="hint" style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">
+      <div class="hint" style="font-size:11.5px;color:var(--text-faint);margin-top:8px;" id="flota-chips-contador">
         {{ camiones_activos_count }} de {{ camiones_total_count }} camiones activos este día.
       </div>
     {% endif %}
@@ -115,5 +116,32 @@ document.getElementById("form-calcular").addEventListener("submit", () => {
   btn.disabled = true;
   btn.textContent = "Consultando OSRM y optimizando rutas...";
 });
+</script>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const flotaChips = document.getElementById("flota-chips");
+if (flotaChips) {
+  const dia = flotaChips.dataset.dia;
+  flotaChips.querySelectorAll(".camion-chip").forEach(chip => {
+    chip.addEventListener("click", async () => {
+      chip.disabled = true;
+      try {
+        const data = await postJSON("{% url 'rutas:api_toggle_disponibilidad_dia' %}", {
+          nombre_camion: chip.dataset.nombre, dia,
+        });
+        chip.classList.toggle("excluido", !data.disponible);
+        const activos = flotaChips.querySelectorAll(".camion-chip:not(.excluido)").length;
+        const total = flotaChips.querySelectorAll(".camion-chip").length;
+        document.getElementById("flota-chips-contador").textContent = `${activos} de ${total} camiones activos este día.`;
+      } catch (e) {
+        alert("No se pudo actualizar: " + e.message);
+      } finally {
+        chip.disabled = false;
+      }
+    });
+  });
+}
 </script>
 {% endblock %}

@@ -1,6 +1,8 @@
 {% extends "rutas/_base.html" %}
 {% block title %}Simulador — Optimizador de Rutas{% endblock %}
 {% block extra_head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   .sim-flota { display: flex; flex-direction: column; gap: 8px; }
   .sim-camion-chk {
@@ -9,8 +11,8 @@
   }
   .sim-camion-chk .nombre { font-weight: 700; flex: 1; }
   .sim-camion-chk .cap { color: var(--text-muted); font-size: 12px; }
-  .sim-stepper { display: flex; align-items: center; gap: 10px; }
-  .sim-stepper button {
+  .sim-stepper { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .sim-stepper button.paso {
     width: 30px; height: 30px; border-radius: 8px; border: 1.5px solid var(--border);
     background: var(--surface); color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer;
   }
@@ -31,6 +33,17 @@
   .sim-delta.mejor { color: var(--accent-strong); }
   .sim-delta.peor { color: var(--danger); }
   .sim-delta.neutro { color: var(--text-faint); }
+
+  .sim-carrera-mapas { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .sim-carrera-mapas { grid-template-columns: 1fr; } }
+  .sim-carrera-titulo { font-weight: 800; font-size: 13px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+  .sim-carrera-titulo .ganador { color: var(--accent-strong); font-size: 12px; }
+  .sim-mapa-carrera { height: 320px; border-radius: 10px; border: 1px solid var(--border); }
+  .sim-carrera-banner {
+    text-align: center; font-weight: 800; padding: 10px; border-radius: 8px; margin-bottom: 12px;
+    background: var(--accent-soft); color: var(--accent-strong); display: none;
+  }
+  .sim-carrera-banner.activo { display: block; }
 </style>
 {% endblock %}
 
@@ -68,10 +81,14 @@
       </div>
       <div class="sim-stepper" style="margin-top:14px;">
         <span style="font-size:13px;">+ Camiones simulados:</span>
-        <button type="button" id="sim-camion-menos">−</button>
+        <button type="button" class="paso" id="sim-camion-menos">−</button>
         <span class="valor" id="sim-camion-valor">0</span>
-        <button type="button" id="sim-camion-mas">+</button>
+        <button type="button" class="paso" id="sim-camion-mas">+</button>
+        <button type="button" class="btn" id="sim-btn-aplicar" disabled style="margin-left:auto;">
+          ✓ Aplicar esta simulación (crear camión real)
+        </button>
       </div>
+      <p class="caption" id="sim-aplicar-estado" style="margin:8px 0 0;"></p>
     </div>
   </div>
 
@@ -115,6 +132,30 @@
       </div>
     </div>
   </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>4. Carrera: Actual vs Simulado</h2>
+      <button class="btn" type="button" id="sim-btn-carrera" disabled>🏁 Iniciar carrera</button>
+    </div>
+    <div class="card-body">
+      <p class="caption" id="sim-carrera-ayuda" style="margin-top:0;">
+        Corré una simulación arriba primero -- acá se anima el recorrido de cada escenario a un ritmo
+        proporcional a sus horas reales de jornada, para ver de un vistazo cuál termina antes.
+      </p>
+      <div class="sim-carrera-banner" id="sim-carrera-banner"></div>
+      <div class="sim-carrera-mapas">
+        <div>
+          <div class="sim-carrera-titulo"><span>Actual</span><span class="ganador" id="sim-carrera-actual-tiempo"></span></div>
+          <div id="sim-mapa-actual" class="sim-mapa-carrera"></div>
+        </div>
+        <div>
+          <div class="sim-carrera-titulo"><span>Simulado</span><span class="ganador" id="sim-carrera-simulado-tiempo"></span></div>
+          <div id="sim-mapa-simulado" class="sim-mapa-carrera"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 {% endif %}
 {% endblock %}
 
@@ -122,16 +163,25 @@
 {% if tiene_datos %}
 <script>
 const resumenActual = {{ resumen_actual|default:"null"|safe }};
+const resultadoActual = {{ resultado_actual_json|safe }};
+const horaInicioConfig = "{{ hora_inicio }}";
 let camionesExtra = 0;
+let ultimoResultadoSimulado = null;
 
 const valorCamiones = document.getElementById("sim-camion-valor");
+const btnAplicar = document.getElementById("sim-btn-aplicar");
+function actualizarBotonAplicar() {
+  btnAplicar.disabled = camionesExtra === 0;
+}
 document.getElementById("sim-camion-mas").addEventListener("click", () => {
   camionesExtra = Math.min(10, camionesExtra + 1);
   valorCamiones.textContent = camionesExtra;
+  actualizarBotonAplicar();
 });
 document.getElementById("sim-camion-menos").addEventListener("click", () => {
   camionesExtra = Math.max(0, camionesExtra - 1);
   valorCamiones.textContent = camionesExtra;
+  actualizarBotonAplicar();
 });
 
 const sliderPeso = document.getElementById("sim-peso-slider");
@@ -156,6 +206,8 @@ function deltaHtml(actual, simulado, mejorSiBaja) {
 const btnSimular = document.getElementById("sim-btn-simular");
 const estadoDiv = document.getElementById("sim-estado");
 const resultadoDiv = document.getElementById("sim-resultado");
+const btnCarrera = document.getElementById("sim-btn-carrera");
+const carreraAyuda = document.getElementById("sim-carrera-ayuda");
 
 btnSimular.addEventListener("click", async () => {
   btnSimular.disabled = true;
@@ -177,22 +229,181 @@ btnSimular.addEventListener("click", async () => {
     const data = await resp.json();
     if (!resp.ok) {
       resultadoDiv.innerHTML = `<p class="caption" style="color:var(--danger);">${data.error || "No se pudo simular."}</p>`;
+      ultimoResultadoSimulado = null;
+      btnCarrera.disabled = true;
       return;
     }
+    const r = data.resumen;
     resultadoDiv.innerHTML = `
-      <div class="sim-fila"><span>Camiones usados</span><span class="val">${data.camiones_usados}${resumenActual ? deltaHtml(resumenActual.camiones_usados, data.camiones_usados, false) : ""}</span></div>
-      <div class="sim-fila"><span>Distancia total</span><span class="val">${data.dist_total_km.toFixed(1)} km${resumenActual ? deltaHtml(resumenActual.dist_total_km, data.dist_total_km, true) : ""}</span></div>
-      <div class="sim-fila"><span>Peso total</span><span class="val">${Math.round(data.peso_total).toLocaleString("es-CR")} kg</span></div>
-      <div class="sim-fila"><span>Fin estimado</span><span class="val">${data.hora_fin_max}</span></div>
-      <div class="sim-fila"><span>Camiones sobre jornada</span><span class="val">${data.camiones_excedidos}${resumenActual ? deltaHtml(resumenActual.camiones_excedidos, data.camiones_excedidos, true) : ""}</span></div>
+      <div class="sim-fila"><span>Camiones usados</span><span class="val">${r.camiones_usados}${resumenActual ? deltaHtml(resumenActual.camiones_usados, r.camiones_usados, false) : ""}</span></div>
+      <div class="sim-fila"><span>Distancia total</span><span class="val">${r.dist_total_km.toFixed(1)} km${resumenActual ? deltaHtml(resumenActual.dist_total_km, r.dist_total_km, true) : ""}</span></div>
+      <div class="sim-fila"><span>Peso total</span><span class="val">${Math.round(r.peso_total).toLocaleString("es-CR")} kg</span></div>
+      <div class="sim-fila"><span>Fin estimado</span><span class="val">${r.hora_fin_max}</span></div>
+      <div class="sim-fila"><span>Camiones sobre jornada</span><span class="val">${r.camiones_excedidos}${resumenActual ? deltaHtml(resumenActual.camiones_excedidos, r.camiones_excedidos, true) : ""}</span></div>
     `;
+    ultimoResultadoSimulado = data.resultado;
+    btnCarrera.disabled = !(resultadoActual && ultimoResultadoSimulado);
+    carreraAyuda.textContent = btnCarrera.disabled
+      ? "El escenario actual no tiene resultado válido para animar."
+      : "Listo -- tocá \"Iniciar carrera\" para animar los dos escenarios.";
   } catch (e) {
     resultadoDiv.innerHTML = `<p class="caption" style="color:var(--danger);">Error: ${e.message}</p>`;
+    ultimoResultadoSimulado = null;
+    btnCarrera.disabled = true;
   } finally {
     btnSimular.disabled = false;
     btnSimular.textContent = "▶ Simular";
   }
 });
+
+btnAplicar.addEventListener("click", async () => {
+  if (camionesExtra === 0) return;
+  const plural = camionesExtra === 1 ? "" : "es";
+  if (!confirm(`Esto va a crear ${camionesExtra} camión${plural} real${plural} en tu flota, con la capacidad promedio actual. ¿Confirmás?`)) return;
+  const estado = document.getElementById("sim-aplicar-estado");
+  btnAplicar.disabled = true;
+  estado.textContent = "Creando...";
+  try {
+    const resp = await fetch("{% url 'rutas:api_simulador_aplicar' %}", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-CSRFToken": getCookie("csrftoken")},
+      body: JSON.stringify({camiones_extra: camionesExtra}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      estado.textContent = "Error: " + (data.error || "no se pudo aplicar.");
+      btnAplicar.disabled = false;
+      return;
+    }
+    estado.innerHTML = `Creado(s): <b>${data.creados.join(", ")}</b>. <a href="{% url 'rutas:camiones' %}" style="font-weight:700;">Ver en Camiones →</a>`;
+  } catch (e) {
+    estado.textContent = "Error: " + e.message;
+    btnAplicar.disabled = false;
+  }
+});
+
+// ── Modo carrera: dos mapas animando Actual vs Simulado a un ritmo
+// proporcional a las horas reales de jornada de cada escenario -- así el
+// que "gana" la carrera es el que de verdad termina antes en la realidad,
+// no solo el que tiene menos km.
+function distanciaHaversineM(a, b) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+  const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function horasDecimal(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h + m / 60;
+}
+function posicionEnDistanciaCarrera(ruta, distM) {
+  const {camino, acumuladas} = ruta;
+  if (distM <= 0) return camino[0];
+  if (distM >= ruta.distanciaTotal) return camino[camino.length - 1];
+  let i = 1;
+  while (acumuladas[i] < distM) i++;
+  const d0 = acumuladas[i - 1], d1 = acumuladas[i];
+  const t = d1 > d0 ? (distM - d0) / (d1 - d0) : 0;
+  const p0 = camino[i - 1], p1 = camino[i];
+  return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+}
+
+const SEGUNDOS_POR_HORA_REAL = 3; // 1 hora de jornada real = 3 segundos de animación
+
+function construirEscenarioCarrera(divId, resultado, color) {
+  const map = L.map(divId, {attributionControl: false}).setView([9.98, -84.13], 12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OSM"}).addTo(map);
+
+  const rutas = [];
+  const bounds = [];
+  resultado.camiones.forEach(c => {
+    const duracionH = Math.max(0.05, horasDecimal(c.hora_fin) - horasDecimal(horaInicioConfig));
+    c.tramos.forEach(tramo => {
+      if (tramo.trip_idx >= c.n_viajes_usados) return;
+      if (!tramo.camino || tramo.camino.length < 2) return;
+      const acumuladas = [0];
+      for (let i = 1; i < tramo.camino.length; i++) {
+        acumuladas.push(acumuladas[i - 1] + distanciaHaversineM(tramo.camino[i - 1], tramo.camino[i]));
+      }
+      const distanciaTotal = acumuladas[acumuladas.length - 1];
+      const velocidadMS = distanciaTotal / (duracionH * SEGUNDOS_POR_HORA_REAL);
+      const marker = L.circleMarker(tramo.camino[0], {radius: 7, color: "#fff", weight: 2, fillColor: color, fillOpacity: 1}).addTo(map);
+      L.polyline(tramo.camino, {color, weight: 2, opacity: 0.3}).addTo(map);
+      rutas.push({camino: tramo.camino, acumuladas, distanciaTotal, velocidadMS, progresoM: 0, marker});
+      tramo.camino.forEach(p => bounds.push(p));
+    });
+  });
+  if (bounds.length) map.fitBounds(bounds, {padding: [12, 12]});
+  const duracionMaxH = Math.max(...resultado.camiones.map(c => horasDecimal(c.hora_fin) - horasDecimal(horaInicioConfig)));
+  return {map, rutas, duracionSegundos: Math.max(0.05, duracionMaxH) * SEGUNDOS_POR_HORA_REAL};
+}
+
+let mapaActualCarrera = null, mapaSimuladoCarrera = null;
+let animandoCarrera = false, rafCarreraId = null, inicioCarreraMs = null;
+let terminoActual = false, terminoSimulado = false;
+
+btnCarrera.addEventListener("click", () => {
+  if (!resultadoActual || !ultimoResultadoSimulado) return;
+  btnCarrera.disabled = true;
+  document.getElementById("sim-carrera-banner").classList.remove("activo");
+  document.getElementById("sim-carrera-actual-tiempo").textContent = "";
+  document.getElementById("sim-carrera-simulado-tiempo").textContent = "";
+  if (mapaActualCarrera) mapaActualCarrera.map.remove();
+  if (mapaSimuladoCarrera) mapaSimuladoCarrera.map.remove();
+  mapaActualCarrera = construirEscenarioCarrera("sim-mapa-actual", resultadoActual, "#2980B9");
+  mapaSimuladoCarrera = construirEscenarioCarrera("sim-mapa-simulado", ultimoResultadoSimulado, "#E67E22");
+  terminoActual = false;
+  terminoSimulado = false;
+  inicioCarreraMs = null;
+  animandoCarrera = true;
+  rafCarreraId = requestAnimationFrame(pasoCarrera);
+});
+
+function avanzarEscenario(escenario, dtS) {
+  let todosListos = true;
+  escenario.rutas.forEach(r => {
+    if (r.progresoM >= r.distanciaTotal) return;
+    todosListos = false;
+    r.progresoM = Math.min(r.distanciaTotal, r.progresoM + r.velocidadMS * dtS);
+    r.marker.setLatLng(posicionEnDistanciaCarrera(r, r.progresoM));
+  });
+  return todosListos;
+}
+
+function pasoCarrera(timestamp) {
+  if (inicioCarreraMs === null) inicioCarreraMs = timestamp;
+  const dtS = Math.min(0.25, (timestamp - (pasoCarrera._ultimo || timestamp)) / 1000);
+  pasoCarrera._ultimo = timestamp;
+
+  if (!terminoActual) terminoActual = avanzarEscenario(mapaActualCarrera, dtS);
+  if (!terminoSimulado) terminoSimulado = avanzarEscenario(mapaSimuladoCarrera, dtS);
+
+  if (terminoActual && !document.getElementById("sim-carrera-actual-tiempo").textContent) {
+    document.getElementById("sim-carrera-actual-tiempo").textContent = "🏁 " + ((timestamp - inicioCarreraMs) / 1000).toFixed(1) + "s";
+  }
+  if (terminoSimulado && !document.getElementById("sim-carrera-simulado-tiempo").textContent) {
+    document.getElementById("sim-carrera-simulado-tiempo").textContent = "🏁 " + ((timestamp - inicioCarreraMs) / 1000).toFixed(1) + "s";
+  }
+
+  if (terminoActual && terminoSimulado) {
+    animandoCarrera = false;
+    pasoCarrera._ultimo = null;
+    const banner = document.getElementById("sim-carrera-banner");
+    banner.classList.add("activo");
+    if (Math.abs(mapaActualCarrera.duracionSegundos - mapaSimuladoCarrera.duracionSegundos) < 0.15) {
+      banner.textContent = "🤝 Empate -- casi la misma duración real.";
+    } else if (mapaSimuladoCarrera.duracionSegundos < mapaActualCarrera.duracionSegundos) {
+      banner.textContent = "🏆 El escenario Simulado termina antes en la realidad.";
+    } else {
+      banner.textContent = "🏆 El escenario Actual termina antes en la realidad.";
+    }
+    btnCarrera.disabled = false;
+    return;
+  }
+  if (animandoCarrera) rafCarreraId = requestAnimationFrame(pasoCarrera);
+}
 </script>
 {% endif %}
 {% endblock %}

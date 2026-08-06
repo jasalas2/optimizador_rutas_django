@@ -244,7 +244,8 @@ def obtener_ruta_completa_osrm(stops):
 
 
 def resolver_vrp(distancias, demandas, capacidades, start_nodes, end_node,
-                 asignaciones=None, balancear=False, viajes_max=1):
+                 asignaciones=None, balancear=False, viajes_max=1,
+                 peso_minimo_viaje_extra_kg=0):
     """
     VRP multi-vehículo con restricción de capacidad POR CAMIÓN, SALIDA
     PROPIA POR CAMIÓN, y soporte de VIAJES MÚLTIPLES: un camión puede
@@ -273,6 +274,15 @@ def resolver_vrp(distancias, demandas, capacidades, start_nodes, end_node,
     - viajes_max: máximo de viajes por camión. Puede ser:
         · un entero → se aplica igual a todos los camiones
         · una lista del mismo largo que `capacidades` → un valor por camión
+    - peso_minimo_viaje_extra_kg: penaliza (blando, no prohíbe) que el 2do,
+      3er, etc. viaje de un camión cargue MENOS que esto -- para evitar
+      viajes casi vacíos a descargar (gasto de tiempo/combustible por poco).
+      El primer viaje de cada camión NUNCA se penaliza (siempre hace falta).
+      0 = desactivado (comportamiento igual que antes). Es un empujón, no
+      una regla dura: si de verdad no hay forma de evitar un viaje chico
+      (ej. un punto lejano que no cabe en ningún otro viaje), igual se
+      genera -- verificado que el solver NUNCA penaliza un viaje que
+      termina SIN USARSE, solo uno que se usa con poca carga.
 
     Devuelve una lista por camión real, y cada elemento es a su vez una
     lista de "viajes" (sub-rutas) EFECTIVAMENTE USADOS, en orden:
@@ -323,6 +333,22 @@ def resolver_vrp(distancias, demandas, capacidades, start_nodes, end_node,
         int(capacidades[i]) for i in range(n_camiones) for _ in range(vm_list[i])
     ]
     routing.AddDimensionWithVehicleCapacity(d, 0, pseudo_capacidades, True, "Capacidad")
+
+    # ── Penalizar viajes EXTRA (2do, 3er...) con poca carga (opcional) ──
+    # Probado a mano: SetCumulVarSoftLowerBound NO penaliza un pseudo-vehículo
+    # que termina sin usarse (ruta vacía) -- solo uno que se usa de verdad con
+    # carga por debajo del mínimo. Coeficiente fijo (no expuesto al usuario,
+    # mismo criterio que el 100 de "balancear"): cada kg de más bajo el
+    # mínimo "cuesta" como si fueran 50 metros extra de recorrido.
+    if peso_minimo_viaje_extra_kg > 0:
+        cap_dim = routing.GetDimensionOrDie("Capacidad")
+        COEFICIENTE_PENALIZACION_VIAJE_CHICO = 50
+        for i in range(n_camiones):
+            for trip in range(1, vm_list[i]):  # nunca el primer viaje (trip 0)
+                pseudo_idx = offsets[i] + trip
+                cap_dim.SetCumulVarSoftLowerBound(
+                    routing.End(pseudo_idx), int(peso_minimo_viaje_extra_kg),
+                    COEFICIENTE_PENALIZACION_VIAJE_CHICO)
 
     # ── Asignación manual: el punto puede ir en CUALQUIER viaje de ese camión ──
     if asignaciones:
@@ -507,7 +533,8 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
                                hora_inicio, velocidad_kmh, tiempo_parada, balancear,
                                velocidad_variable_via=False, velocidad_rapida_kmh=None,
                                tiempo_descarga=None, hora_almuerzo_inicio=None,
-                               hora_almuerzo_fin=None, tope_horas_jornada=8.0):
+                               hora_almuerzo_fin=None, tope_horas_jornada=8.0,
+                               peso_minimo_viaje_extra_kg=0):
     """
     Corre el cálculo completo de rutas para un subconjunto de puntos y la
     flota de camiones dada. Devuelve (resultado, None) si todo salió bien,
@@ -595,7 +622,8 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
     distancias, uso_osrm, error_matriz = obtener_matriz_osrm(LOCATIONS)
     rutas = resolver_vrp(distancias, PESOS, CAPACIDADES, start_nodes, end_node,
                          asignaciones=asignaciones or None, balancear=balancear,
-                         viajes_max=VIAJES_MAX_CAM)
+                         viajes_max=VIAJES_MAX_CAM,
+                         peso_minimo_viaje_extra_kg=peso_minimo_viaje_extra_kg)
 
     # ── Velocidad variable por tipo de vía (opcional) ──
     # Se descarga (o se reusa del caché, ver descargar_red_osm_clasificada_cacheada)

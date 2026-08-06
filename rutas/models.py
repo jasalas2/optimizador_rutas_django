@@ -26,6 +26,12 @@ class ConfiguracionGeneral(models.Model):
 
     balancear = models.BooleanField(default=False)
 
+    peso_minimo_viaje_extra_kg = models.PositiveIntegerField(
+        default=0, validators=[MinValueValidator(0), MaxValueValidator(50000)],
+        help_text="Desalienta (no prohíbe) que el 2do/3er viaje de un camión cargue menos que "
+                   "esto -- evita viajes casi vacíos a descargar. 0 = desactivado.",
+    )
+
     depot2_lat = models.FloatField(default=9.964356, validators=LAT_VALIDATORS)
     depot2_lon = models.FloatField(default=-84.161528, validators=LON_VALIDATORS)
 

@@ -267,6 +267,37 @@ def camiones_view(request):
 
 
 @require_POST
+def api_toggle_disponibilidad_dia(request):
+    """Prende/apaga UN camión para UN día puntual -- versión rápida de
+    api_guardar_disponibilidad_camiones (que guarda la semana completa de
+    todos los camiones de una), usada desde las burbujas clicables de
+    Calcular. Mismo modelo (CamionDisponibilidad), misma semántica: `dias`
+    vacío = disponible todos los días."""
+    data = json.loads(request.body)
+    nombre_camion = (data.get("nombre_camion") or "").strip()
+    dia = (data.get("dia") or "").strip()
+    if not nombre_camion or dia not in DIAS_SEMANA:
+        return JsonResponse({"error": "Parámetros inválidos."}, status=400)
+    if not Camion.objects.filter(nombre=nombre_camion).exists():
+        return JsonResponse({"error": "Ese camión ya no existe."}, status=404)
+
+    cd, _ = CamionDisponibilidad.objects.get_or_create(nombre_camion=nombre_camion)
+    dias_actuales = {d.strip() for d in cd.dias.split(",") if d.strip()}
+    if not dias_actuales:
+        dias_actuales = set(DIAS_SEMANA)  # "sin restricción" == disponible todos los días
+
+    if dia in dias_actuales:
+        dias_actuales.discard(dia)
+    else:
+        dias_actuales.add(dia)
+
+    cd.dias = "" if dias_actuales == set(DIAS_SEMANA) else ",".join(d for d in DIAS_SEMANA if d in dias_actuales)
+    cd.save()
+    disponible = dia in dias_actuales
+    return JsonResponse({"disponible": disponible})
+
+
+@require_POST
 def api_guardar_disponibilidad_camiones(request):
     idx = 0
     while f"camion__{idx}" in request.POST:
@@ -372,6 +403,9 @@ def configuracion_view(request):
             config.velocidad_rapida_kmh = _parsear_num(request.POST.get("velocidad_rapida_kmh"), config.velocidad_rapida_kmh, int)
 
         config.balancear = request.POST.get("balancear") == "on"
+
+        config.peso_minimo_viaje_extra_kg = _parsear_num(
+            request.POST.get("peso_minimo_viaje_extra_kg"), config.peso_minimo_viaje_extra_kg, int)
 
         config.depot2_lat = _parsear_num(request.POST.get("depot2_lat"), config.depot2_lat)
         config.depot2_lon = _parsear_num(request.POST.get("depot2_lon"), config.depot2_lon)
@@ -681,11 +715,28 @@ def _resumen_calculo(resultado):
     }
 
 
+def _especificaciones_promedio_flota():
+    """Capacidad/personas/viajes/plantel promedio de la flota REAL actual --
+    usado tanto para armar un "camión simulado" en el Simulador como para
+    crearlo de verdad si el usuario aplica esa simulación."""
+    base = _camiones_dataframe().dropna(subset=["Nombre", "Capacidad (kg)"])
+    if len(base) == 0:
+        return None
+    return {
+        "capacidad_kg": base["Capacidad (kg)"].mean(),
+        "personas": max(1, round(base["Personas"].mean())),
+        "viajes_max": max(1, round(base["Viajes máx."].mean())),
+        "plantel_lat": base["Plantel Lat"].dropna().mean(),
+        "plantel_lon": base["Plantel Lon"].dropna().mean(),
+    }
+
+
 def _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_pct):
     """Corre calcular_rutas_para_puntos con la flota/puntos actuales pero
     MODIFICADOS en memoria (nunca se guarda nada) -- para el Simulador
     "¿qué pasa si...?". Reusa la misma lógica que Calcular ("Todos los
-    puntos juntos"), sin tocar core/optimizador.py."""
+    puntos juntos"), sin tocar core/optimizador.py. Devuelve el resultado
+    COMPLETO (no solo el resumen) para poder animarlo en el mapa."""
     config = ConfiguracionGeneral.cargar()
 
     tabla_puntos = _puntos_dataframe().dropna(subset=["Latitud", "Longitud"]).copy()
@@ -698,17 +749,12 @@ def _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_p
         tabla_camiones = tabla_camiones[~tabla_camiones["Nombre"].isin(camiones_excluidos)]
 
     if camiones_extra > 0:
-        base = _camiones_dataframe().dropna(subset=["Nombre", "Capacidad (kg)"])
-        if len(base) > 0:
-            cap_prom = base["Capacidad (kg)"].mean()
-            personas_prom = max(1, round(base["Personas"].mean()))
-            viajes_prom = max(1, round(base["Viajes máx."].mean()))
-            lat_prom = base["Plantel Lat"].dropna().mean()
-            lon_prom = base["Plantel Lon"].dropna().mean()
+        specs = _especificaciones_promedio_flota()
+        if specs is not None:
             filas_extra = [{
-                "Nombre": f"Camión simulado {i + 1}", "Capacidad (kg)": cap_prom,
-                "Personas": personas_prom, "Viajes máx.": viajes_prom,
-                "Plantel Lat": lat_prom, "Plantel Lon": lon_prom,
+                "Nombre": f"Camión simulado {i + 1}", "Capacidad (kg)": specs["capacidad_kg"],
+                "Personas": specs["personas"], "Viajes máx.": specs["viajes_max"],
+                "Plantel Lat": specs["plantel_lat"], "Plantel Lon": specs["plantel_lon"],
                 "Cantón asignado": "", "Distrito asignado": "",
             } for i in range(camiones_extra)]
             tabla_camiones = pd.concat([tabla_camiones, pd.DataFrame(filas_extra)], ignore_index=True)
@@ -727,22 +773,26 @@ def _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_p
         hora_almuerzo_inicio=config.hora_almuerzo_inicio if config.usar_almuerzo else None,
         hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
         tope_horas_jornada=config.tope_horas_jornada,
+        peso_minimo_viaje_extra_kg=config.peso_minimo_viaje_extra_kg,
     )
     resultado, error = calcular_rutas_para_puntos(tabla_puntos, tabla_camiones, **kwargs_comunes)
     if error:
         return None, error
-    return _resumen_calculo(resultado), None
+    return resultado, None
 
 
 def simulador_view(request):
     camiones = list(Camion.objects.all())
     tiene_datos = Punto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True).exists() and camiones
-    resumen_actual, error_actual = (_ejecutar_calculo_simulado([], 0, 0) if tiene_datos else (None, None))
+    resultado_actual, error_actual = (_ejecutar_calculo_simulado([], 0, 0) if tiene_datos else (None, None))
+    config = ConfiguracionGeneral.cargar()
     context = {
         "camiones": camiones,
         "tiene_datos": tiene_datos,
-        "resumen_actual": resumen_actual,
+        "resumen_actual": _resumen_calculo(resultado_actual) if resultado_actual else None,
+        "resultado_actual_json": json.dumps(resultado_actual) if resultado_actual else "null",
         "error_actual": error_actual,
+        "hora_inicio": config.hora_inicio.strftime("%H:%M"),
     }
     return render(request, "rutas/simulador.html", context)
 
@@ -757,10 +807,43 @@ def api_simulador_calcular(request):
     except (TypeError, ValueError):
         return JsonResponse({"error": "Parámetros inválidos."}, status=400)
 
-    resumen, error = _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_pct)
+    resultado, error = _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_pct)
     if error:
         return JsonResponse({"error": error}, status=400)
-    return JsonResponse(resumen)
+    return JsonResponse({"resumen": _resumen_calculo(resultado), "resultado": resultado})
+
+
+@require_POST
+def api_simulador_aplicar(request):
+    """Crea de verdad, como Camion reales, los "camiones simulados" que el
+    usuario probó en el Simulador -- NUNCA toca los camiones que se
+    excluyeron en la simulación (eso es hipotético, no se borra nada real)
+    ni el % de cambio de peso (es una proyección, no un dato a guardar)."""
+    data = json.loads(request.body)
+    try:
+        camiones_extra = max(1, min(10, int(data.get("camiones_extra", 0))))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Parámetros inválidos."}, status=400)
+
+    specs = _especificaciones_promedio_flota()
+    if specs is None:
+        return JsonResponse({"error": "Necesitás al menos 1 camión real para calcular el promedio."}, status=400)
+
+    existentes = set(Camion.objects.values_list("nombre", flat=True))
+    creados = []
+    n = 1
+    while len(creados) < camiones_extra and n <= 1000:
+        nombre = f"Camión simulado {n}"
+        n += 1
+        if nombre in existentes:
+            continue
+        Camion.objects.create(
+            nombre=nombre, capacidad_kg=specs["capacidad_kg"], personas=specs["personas"],
+            viajes_max=specs["viajes_max"], plantel_lat=specs["plantel_lat"], plantel_lon=specs["plantel_lon"],
+        )
+        creados.append(nombre)
+        existentes.add(nombre)
+    return JsonResponse({"creados": creados})
 
 
 def _redirect_calcular(dia):
@@ -889,6 +972,7 @@ def api_ejecutar_calculo(request):
         hora_almuerzo_inicio=config.hora_almuerzo_inicio if config.usar_almuerzo else None,
         hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
         tope_horas_jornada=config.tope_horas_jornada,
+        peso_minimo_viaje_extra_kg=config.peso_minimo_viaje_extra_kg,
     )
 
     if modo_calculo == "Todos los puntos juntos":

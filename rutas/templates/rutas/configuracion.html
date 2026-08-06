@@ -77,6 +77,13 @@
       <div class="help">Si está activo, reparte las paradas entre todos los camiones aunque el peso quepa en
         uno solo. Si está inactivo, usa la menor cantidad de camiones posible (menor distancia total).</div>
 
+      <label for="peso_minimo_viaje_extra_kg">Peso mínimo deseado en el 2do/3er viaje de un camión (kg)</label>
+      <input type="number" id="peso_minimo_viaje_extra_kg" name="peso_minimo_viaje_extra_kg" min="0" max="50000" step="100" value="{{ config.peso_minimo_viaje_extra_kg }}">
+      <div class="help">Desalienta -- no prohíbe -- que un viaje extra (no el primero, que siempre hace falta)
+        cargue menos que esto, para evitar viajes casi vacíos a Planta San Antonio (gasto de tiempo y
+        combustible por poco). 0 = desactivado. Si de verdad no hay forma de evitarlo (ej. un punto lejano
+        que no cabe en ningún otro viaje), el viaje chico igual se genera.</div>
+
       <hr class="div">
       <h2 style="font-size:14px;">Planta San Antonio</h2>
       <div class="caption">Punto único donde TODOS los camiones descargan. La salida de cada camión se
