@@ -27,6 +27,13 @@
   .dia-tab.activo { border-color: var(--accent-strong); background: var(--accent-soft); color: var(--accent-strong); }
   .dia-tab .estado.ok { color: var(--accent-strong); }
   .dia-tab .estado.pend { color: var(--text-faint); }
+
+  @keyframes flotar-desvanecer {
+    0% { opacity: 0; transform: translate(-50%, -100%) scale(0.8); }
+    15% { opacity: 1; transform: translate(-50%, -100%) scale(1.05); }
+    100% { opacity: 0; transform: translate(-50%, -160%) scale(1); }
+  }
+  .efecto-recoleccion { animation: flotar-desvanecer 1.1s ease-out forwards; }
 </style>
 {% endblock %}
 
@@ -136,11 +143,15 @@
           <option value="5">5x</option>
           <option value="10" selected>10x</option>
           <option value="25">25x</option>
+          <option value="50">50x</option>
         </select>
         <select id="select-modo-animacion" title="Qué recorrer">
           <option value="viaje">Por viaje</option>
           <option value="camion">Camión completo (todos los viajes)</option>
         </select>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;cursor:pointer;">
+          <input type="checkbox" id="chk-seguir-camara"> Seguir cámara
+        </label>
         <div id="filtro-dias" class="filtro-dias"></div>
       </div>
     </div>
@@ -363,27 +374,45 @@ function iconoFlechaAnimada(color) {
 
 // distancia acumulada (a lo largo del camino) del punto de `camino` más
 // cercano a `puntoLatLon` -- para saber en qué metro del recorrido cae cada
-// parada real, y así poder pausar ahí durante la animación.
-function distanciaAlPuntoMasCercano(camino, acumuladas, puntoLatLon) {
-  let mejorIdx = 0, mejorDist = Infinity;
-  for (let i = 0; i < camino.length; i++) {
+// parada real, y así poder pausar ahí durante la animación. `desde`/`hasta`
+// acotan la búsqueda a un tramo del camino -- necesario en "camión
+// completo", donde un mismo lugar (Planta San Antonio) aparece VARIAS
+// veces (una por viaje): sin acotar, las 3 descargas encontrarían todas el
+// mismo primer paso por ahí, en vez de cada una su propia vuelta real.
+function distanciaAlPuntoMasCercano(camino, acumuladas, puntoLatLon, desde, hasta) {
+  let mejorIdx = desde ?? 0, mejorDist = Infinity;
+  const fin = hasta ?? camino.length - 1;
+  for (let i = desde ?? 0; i <= fin; i++) {
     const d = distanciaHaversineM(camino[i], puntoLatLon);
     if (d < mejorDist) { mejorDist = d; mejorIdx = i; }
   }
   return acumuladas[mejorIdx];
 }
 
-function construirRutaAnimada(etiqueta, camino, color, paradasLatLon) {
+// checkpointsInfo: [{lat, lon, nombre, peso, tipo: "parada"|"descarga", idxDesde, idxHasta}, ...]
+// idxDesde/idxHasta son opcionales -- acotan en qué tramo de `camino` buscar
+// el punto más cercano (ver distanciaAlPuntoMasCercano).
+function construirRutaAnimada(etiqueta, camino, color, checkpointsInfo) {
   const acumuladas = [0];
   for (let i = 1; i < camino.length; i++) {
     acumuladas.push(acumuladas[i - 1] + distanciaHaversineM(camino[i - 1], camino[i]));
   }
   const distanciaTotal = acumuladas[acumuladas.length - 1];
-  const paradas = paradasLatLon
-    .map(p => distanciaAlPuntoMasCercano(camino, acumuladas, p))
-    .filter(d => d > 5 && d < distanciaTotal - 5) // ignora las pegadas al inicio/fin
-    .sort((a, b) => a - b)
-    .map(distM => ({distM, hecha: false}));
+  const paradas = checkpointsInfo
+    .map(p => ({
+      // "descarga" trae su índice EXACTO (siempre el último punto de su
+      // propio tramo/viaje) -- no hace falta (ni conviene) buscar el más
+      // cercano, porque el INICIO de un viaje también queda pegado a la
+      // planta (el camión sale de ahí después de descargar), así que una
+      // búsqueda por cercanía podía confundir el inicio del viaje siguiente
+      // con el final real del viaje actual.
+      distM: p.idxExacto !== undefined ? acumuladas[p.idxExacto]
+        : distanciaAlPuntoMasCercano(camino, acumuladas, [p.lat, p.lon], p.idxDesde, p.idxHasta),
+      nombre: p.nombre, peso: p.peso, tipo: p.tipo,
+    }))
+    .filter(p => p.distM > 5 && p.distM < distanciaTotal - 5) // ignora las pegadas al inicio/fin
+    .sort((a, b) => a.distM - b.distM)
+    .map(p => ({...p, hecha: false}));
   const marker = L.marker(camino[0], {icon: iconoFlechaAnimada(color), interactive: true})
     .bindTooltip(etiqueta, {direction: "top", offset: [0, -10]});
   return {
@@ -391,6 +420,28 @@ function construirRutaAnimada(etiqueta, camino, color, paradasLatLon) {
     progresoM: 0, pausadoHasta: 0,
     marker,
   };
+}
+
+// Efecto visual breve en cada parada/descarga: un texto que sube y se
+// desvanece, para conectar visualmente el mapa con el peso que ya calcula
+// el sistema (verde = recolección, azul = descarga en Planta San Antonio).
+function mostrarEfectoRecoleccion(latlng, checkpoint) {
+  const esDescarga = checkpoint.tipo === "descarga";
+  const color = esDescarga ? "#2980B9" : "#1FA98C";
+  const texto = esDescarga
+    ? `⬇ Descarga: ${Math.round(checkpoint.peso).toLocaleString("es-CR")} kg`
+    : `+${Math.round(checkpoint.peso).toLocaleString("es-CR")} kg`;
+  const icono = L.divIcon({
+    className: "",
+    html: `<div class="efecto-recoleccion" style="transform:translate(-50%,-100%);
+             white-space:nowrap;font-family:var(--sans, sans-serif);font-size:12.5px;font-weight:800;
+             color:${color};text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 4px #fff;">
+             ${texto}
+           </div>`,
+    iconSize: [0, 0], iconAnchor: [0, -8],
+  });
+  const marcadorEfecto = L.marker(latlng, {icon: icono, interactive: false, zIndexOffset: 1000}).addTo(map);
+  setTimeout(() => map.removeLayer(marcadorEfecto), 1100);
 }
 
 function posicionEnDistancia(ruta, distM) {
@@ -423,16 +474,30 @@ let ultimoTimestamp = null;
 let rafId = null;
 
 // ── Modo "por viaje": una ruta animada por cada tramo/viaje (como antes) ──
+// "Peso acumulado (kg)" en una fila de descarga es el acumulado del DÍA
+// completo (no se resetea entre viajes), así que para mostrar cuánto
+// descarga ESE viaje puntual hay que sumar lo recogido en sus propias
+// paradas -- no usar el acumulado directo.
+function pesoRecogidoEnViaje(c, tripIdx) {
+  return c.resumen
+    .filter(f => f.tipo === "parada" && f.trip_idx === tripIdx)
+    .reduce((s, f) => s + f["Peso recogido (kg)"], 0);
+}
+
 const rutasPorViaje = [];
 resultado.camiones.forEach(c => {
   c.tramos.forEach(tramo => {
     if (tramo.trip_idx >= c.n_viajes_usados) return; // no animar el tramo "a plantel"
     if (!tramo.camino || tramo.camino.length < 2) return;
     const color = colorPorRuta[`${c.nombre}||${tramo.trip_idx}`];
-    const paradasLatLon = c.resumen
-      .filter(f => f.tipo === "parada" && f.trip_idx === tramo.trip_idx)
-      .map(f => [f.lat, f.lon]);
-    rutasPorViaje.push(construirRutaAnimada(tramo.etiqueta, tramo.camino, color, paradasLatLon));
+    const paradasInfo = c.resumen
+      .filter(f => (f.tipo === "parada" || f.tipo === "descarga") && f.trip_idx === tramo.trip_idx)
+      .map(f => ({
+        lat: f.lat, lon: f.lon, nombre: f.Nombre, tipo: f.tipo,
+        peso: f.tipo === "descarga" ? pesoRecogidoEnViaje(c, f.trip_idx) : f["Peso recogido (kg)"],
+        idxExacto: f.tipo === "descarga" ? tramo.camino.length - 1 : undefined,
+      }));
+    rutasPorViaje.push(construirRutaAnimada(tramo.etiqueta, tramo.camino, color, paradasInfo));
   });
 });
 
@@ -442,15 +507,28 @@ const rutasPorCamion = [];
 resultado.camiones.forEach(c => {
   const tramosOrdenados = [...c.tramos].sort((a, b) => a.trip_idx - b.trip_idx);
   const caminoCompleto = [];
+  const rangoPorViaje = {}; // trip_idx -> {desde, hasta} (índices dentro de caminoCompleto)
   tramosOrdenados.forEach(tramo => {
     if (!tramo.camino || tramo.camino.length === 0) return;
+    const desde = caminoCompleto.length === 0 ? 0 : caminoCompleto.length - 1;
     if (caminoCompleto.length === 0) caminoCompleto.push(...tramo.camino);
     else caminoCompleto.push(...tramo.camino.slice(1)); // evita duplicar el punto de unión entre tramos
+    rangoPorViaje[tramo.trip_idx] = {desde, hasta: caminoCompleto.length - 1};
   });
   if (caminoCompleto.length < 2) return;
   const color = colorPorRuta[`${c.nombre}||0`] || "#374151";
-  const paradasLatLon = c.resumen.filter(f => f.tipo === "parada").map(f => [f.lat, f.lon]);
-  rutasPorCamion.push(construirRutaAnimada(c.nombre, caminoCompleto, color, paradasLatLon));
+  const paradasInfo = c.resumen
+    .filter(f => f.tipo === "parada" || f.tipo === "descarga")
+    .map(f => {
+      const rango = rangoPorViaje[f.trip_idx] || {};
+      return {
+        lat: f.lat, lon: f.lon, nombre: f.Nombre, tipo: f.tipo,
+        peso: f.tipo === "descarga" ? pesoRecogidoEnViaje(c, f.trip_idx) : f["Peso recogido (kg)"],
+        idxDesde: rango.desde, idxHasta: rango.hasta,
+        idxExacto: f.tipo === "descarga" ? rango.hasta : undefined,
+      };
+    });
+  rutasPorCamion.push(construirRutaAnimada(c.nombre, caminoCompleto, color, paradasInfo));
 });
 
 function rutasActuales() {
@@ -476,7 +554,10 @@ actualizarMarcadoresAnimacionVisibilidad();
 const btnPlayAnimacion = document.getElementById("btn-play-animacion");
 const selectVelocidadAnimacion = document.getElementById("select-velocidad-animacion");
 const selectModoAnimacion = document.getElementById("select-modo-animacion");
+const chkSeguirCamara = document.getElementById("chk-seguir-camara");
 multiplicadorVelocidad = parseFloat(selectVelocidadAnimacion.value);
+const ZOOM_SEGUIR_CAMARA = 16;
+let siguiendoCamionEtiqueta = null; // cuál ruta sigue la cámara mientras esté activada
 
 function pasoAnimacion(timestamp) {
   if (ultimoTimestamp === null) ultimoTimestamp = timestamp;
@@ -493,10 +574,19 @@ function pasoAnimacion(timestamp) {
       siguienteParada.hecha = true;
       nuevoProgreso = siguienteParada.distM;
       r.pausadoHasta = timestamp + PAUSA_PARADA_MS;
+      mostrarEfectoRecoleccion(r.marker.getLatLng(), siguienteParada);
     }
     r.progresoM = nuevoProgreso;
     moverMarcador(r, r.progresoM);
   });
+  if (chkSeguirCamara.checked) {
+    const objetivo = rutasActuales().find(r => r.etiqueta === siguiendoCamionEtiqueta && map.hasLayer(r.marker))
+      || rutasActuales().find(r => map.hasLayer(r.marker) && r.progresoM < r.distanciaTotal);
+    if (objetivo) {
+      siguiendoCamionEtiqueta = objetivo.etiqueta;
+      map.setView(objetivo.marker.getLatLng(), Math.max(map.getZoom(), ZOOM_SEGUIR_CAMARA), {animate: false});
+    }
+  }
   if (animando && algunaAvanzando) {
     rafId = requestAnimationFrame(pasoAnimacion);
   } else {
@@ -537,7 +627,12 @@ selectModoAnimacion.addEventListener("change", () => {
   if (rafId) cancelAnimationFrame(rafId);
   btnPlayAnimacion.textContent = "▶ Reproducir recorrido";
   modoAnimacion = selectModoAnimacion.value;
+  siguiendoCamionEtiqueta = null;
   actualizarMarcadoresAnimacionVisibilidad();
+});
+
+chkSeguirCamara.addEventListener("change", () => {
+  siguiendoCamionEtiqueta = null; // al activarla de nuevo, que elija el primer camión visible
 });
 
 // ── Detalle por camión ──
