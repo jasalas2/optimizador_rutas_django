@@ -14,6 +14,7 @@
   .barra-progreso-pista { background: rgba(127,127,127,0.25); border-radius: 999px; height: 10px; overflow: hidden; }
   .barra-progreso-relleno { background: #1FA98C; height: 100%; width: 0%; transition: width 0.4s ease; }
   .barra-progreso-texto { margin-top: 0.4rem; }
+  .rp-controles { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 </style>
 {% endblock %}
 
@@ -23,61 +24,59 @@
     <h1>Red propia <span class="chip warn" style="vertical-align:middle;">Beta</span></h1>
     <div class="sub">
       Independiente del optimizador principal (que usa OSRM y Puntos/Camiones/Calcular). Acá subís
-      tu propia red de calles como shapefile de líneas, y la app calcula la mejor ruta recorriendo
-      esa red.
+      el polígono de una zona o sector de recolección, y la app trae las calles reales de
+      OpenStreetMap que caen adentro y calcula el mejor recorrido que las cubre todas.
     </div>
   </div>
 </div>
 
 <div class="card">
-  <div class="card-head"><h2>1. Subí tu capa de líneas</h2></div>
+  <div class="card-head"><h2>1. Subí el polígono de tu zona/sector</h2></div>
   <div class="card-body">
     <p class="caption" style="margin-top:0;">
       Formatos aceptados: <b>(A)</b> un .zip con el shapefile adentro, <b>(B)</b> los archivos
-      .shp + .shx + .dbf sueltos, <b>(C)</b> un .geojson, o <b>(D)</b> un .gpkg.
+      .shp + .shx + .dbf sueltos, <b>(C)</b> un .geojson, o <b>(D)</b> un .gpkg -- con geometría de
+      polígono. Requiere conexión a internet (para traer las calles de OpenStreetMap).
     </p>
-    <form method="post" action="{% url 'rutas:api_red_propia_cargar' %}" enctype="multipart/form-data" id="form-cargar-red">
+    <form method="post" action="{% url 'rutas:api_red_propia_cargar_poligono' %}" enctype="multipart/form-data" id="form-cargar-red-poligono">
       {% csrf_token %}
-      <label for="archivos">Capa de líneas</label>
+      <label for="archivos">Capa de polígono (zona/sector)</label>
       <input type="file" id="archivos" name="archivos" multiple accept=".zip,.shp,.shx,.dbf,.prj,.geojson,.json,.gpkg">
-      <label for="tolerancia_m">Tolerancia de conexión entre líneas (metros)</label>
-      <input type="number" id="tolerancia_m" name="tolerancia_m" min="0.5" max="100" step="0.5" value="5.0">
-      <div class="help">
-        Dos calles digitalizadas casi nunca coinciden en el cruce EXACTO por errores de precisión
-        al dibujarlas. Esta tolerancia dice: "si dos extremos de línea quedan a menos de esta
-        distancia, son el mismo cruce". Muy baja (ej. 0.5 m) puede dejar la red rota en varias
-        partes que en la calle real sí se conectan; muy alta (ej. 50 m) puede fusionar por error
-        cruces que en verdad son distintos. 5 m funciona bien para la mayoría de shapefiles
-        municipales.
+      <div id="rp-cont-columna-agrupar" style="display:none; margin-top:0.8rem;">
+        <label for="rp-select-columna-agrupar">¿Alguna columna de la tabla de atributos separa el archivo en varias zonas?</label>
+        <select name="columna_agrupar" id="rp-select-columna-agrupar"></select>
       </div>
-      <button type="submit" class="btn primary" id="btn-cargar-red" style="margin-top:1rem;">Cargar red</button>
+      <button type="submit" class="btn primary" id="btn-cargar-red-poligono" style="margin-top:1rem;">Traer calles del polígono</button>
       <div class="barra-progreso-cont {% if progreso.en_progreso %}activa{% endif %}" id="barra-progreso-cont">
         <div class="barra-progreso-pista"><div class="barra-progreso-relleno" id="barra-progreso-relleno"></div></div>
         <p class="caption barra-progreso-texto" id="barra-progreso-texto">{{ progreso.mensaje }}</p>
+        <button type="button" class="btn" id="btn-cancelar-red-poligono" style="margin-top:0.5rem;">Cancelar</button>
       </div>
     </form>
   </div>
 </div>
 
 {% if tiene_grafo %}
-  <div class="stats">
-    <div class="stat"><div class="eyebrow">Líneas leídas</div><div class="val">{{ info.n_lineas }}</div></div>
-    <div class="stat"><div class="eyebrow">Nodos de la red</div><div class="val">{{ info.nodos_json|length }}</div></div>
-    <div class="stat {% if info.n_componentes > 1 %}warn{% else %}ok{% endif %}"><div class="eyebrow">Componentes conectados</div><div class="val">{{ info.n_componentes }}</div></div>
-  </div>
-  {% if info.n_componentes > 1 %}
+  {% if info.zonas_json|length > 1 %}
     <div class="msg warning">
-      La red tiene {{ info.n_componentes }} partes NO conectadas entre sí (tamaños:
-      {{ info.tamano_componentes_json|slice:":3" }} nodos). Si dos de tus puntos caen en partes
-      distintas, la app va a usar línea recta entre ellos.
+      El archivo trae {{ info.zonas_json|length }} zonas separadas (agrupadas por la columna
+      elegida). Elegí cuál ver abajo.
     </div>
-  {% else %}
-    <div class="msg success">✓ La red quedó como un solo componente conectado.</div>
   {% endif %}
 
   <div class="card">
     <div class="card-head">
-      <h2>2. Punto de inicio</h2>
+      <h2>2. Zona y punto de inicio</h2>
+      <div class="btn-row">
+        <select id="rp-select-zona" title="Qué zona mostrar">
+          {% for z in info.zonas_json %}
+            <option value="{{ forloop.counter0 }}" {% if forloop.counter0 == zona_idx_inicial %}selected{% endif %}>{% if z.etiqueta %}{{ z.etiqueta }}{% else %}Zona {{ forloop.counter }}{% endif %} — {{ z.n_lineas }} calles</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="card-body" id="rp-stats-zona"></div>
+    <div class="card-body">
       <div class="btn-row">
         <button class="btn primary" id="btn-guardar-puntos-red">Guardar punto</button>
         <span id="estado-puntos-red"></span>
@@ -89,47 +88,48 @@
     <div class="card-body">
       <p class="caption" style="margin:0;">
         Se usa la <b>primera fila</b> como salida y llegada. El recorrido no elige qué calles
-        visitar: cubre <b>toda la red cargada</b> al menos una vez y cierra el circuito en este
-        mismo punto (si hacen falta filas de más, se ignoran).
+        visitar: cubre <b>toda la red de la zona elegida</b> al menos una vez y cierra el circuito
+        en este mismo punto (si hacen falta filas de más, se ignoran). Si no te importa cuál sea el
+        punto de salida, usá "elegir automático" y no hace falta guardar ninguno a mano.
       </p>
       <form method="post" action="{% url 'rutas:api_red_propia_calcular' %}" id="form-calcular-red">
         {% csrf_token %}
-        <button type="submit" class="btn primary" id="btn-calcular-red" style="margin-top:0.8rem;">Calcular recorrido de cobertura total</button>
+        <input type="hidden" name="zona_idx" id="rp-input-zona-idx" value="0">
+        <div class="btn-row" style="margin-top:0.8rem;">
+          <button type="submit" class="btn primary" id="btn-calcular-red">Calcular recorrido de cobertura total</button>
+          <button type="submit" class="btn" name="auto_inicio" value="1" id="btn-calcular-red-auto">Calcular con punto automático</button>
+        </div>
         <span id="estado-calculo-red" class="caption" style="margin-left:0.6rem;"></span>
       </form>
     </div>
   </div>
 
-  {% if resultado %}
-    <div class="card">
-      <div class="card-head"><h2>3. Resultado</h2></div>
-      <div class="card-body">
-        {% if resultado.nodos_excluidos %}
-          <div class="msg warning">
-            La red tiene {{ resultado.nodos_excluidos }} nodo(s) fuera del componente conectado
-            donde está el punto de inicio — esas calles sueltas no se pudieron incluir en el
-            recorrido.
-          </div>
-        {% endif %}
-        <div class="stats" style="margin-bottom:8px;">
-          <div class="stat"><div class="eyebrow">Calles a cubrir</div><div class="val">{{ resultado.distancia_original_km|floatformat:2 }} <small>km</small></div></div>
-          <div class="stat {% if resultado.distancia_repetida_km > 0 %}warn{% else %}ok{% endif %}"><div class="eyebrow">Repetido para cerrar el circuito</div><div class="val">{{ resultado.distancia_repetida_km|floatformat:2 }} <small>km</small></div></div>
-          <div class="stat ok"><div class="eyebrow">Recorrido total</div><div class="val">{{ resultado.distancia_total_km|floatformat:2 }} <small>km</small></div></div>
-        </div>
-        <p class="caption" style="margin:0 0 4px;">
-          Inicio/fin: <b>{{ resultado.nombre_inicio }}</b>
-          (enganchado a {{ resultado.distancia_enganche_km|floatformat:2 }} km del punto exacto).
-          La línea del recorrido va de <span style="color:#1FA98C;">&#9632;</span> verde (inicio) a
-          <span style="color:#E67E22;">&#9632;</span> naranja (fin), con flechas que marcan el sentido.
-          La capa <span style="color:#E53935;">&#9632;</span> roja (activable arriba a la derecha del
-          mapa) es la red tal cual la subiste, antes de ajustarla a calles reales.
-        </p>
-      </div>
-      <div class="card-body flush">
-        <div id="mapa-red"></div>
+  <div class="card">
+    <div class="card-head">
+      <h2>3. Resultado</h2>
+      <div class="rp-controles" id="rp-controles-animacion" style="display:none;">
+        <button class="btn" type="button" id="rp-btn-play">▶ Reproducir</button>
+        <select id="rp-select-velocidad" title="Velocidad de la animación">
+          <option value="1">1x</option>
+          <option value="5">5x</option>
+          <option value="10" selected>10x</option>
+          <option value="25">25x</option>
+          <option value="50">50x</option>
+        </select>
       </div>
     </div>
-  {% endif %}
+    <div class="card-body" id="rp-cont-sin-resultado">
+      <p class="caption" style="margin:0;">Todavía no calculaste el recorrido de esta zona.</p>
+    </div>
+    <div class="card-body" id="rp-cont-resultado" style="display:none;">
+      <div class="msg warning" id="rp-msg-nodos-excluidos" style="display:none;"></div>
+      <div class="stats" style="margin-bottom:8px;" id="rp-stats-resultado"></div>
+      <p class="caption" id="rp-caption-resultado" style="margin:0 0 4px;"></p>
+    </div>
+    <div class="card-body flush">
+      <div id="mapa-red"></div>
+    </div>
+  </div>
 {% endif %}
 {% endblock %}
 
@@ -139,14 +139,14 @@
   const cont = document.getElementById("barra-progreso-cont");
   const relleno = document.getElementById("barra-progreso-relleno");
   const texto = document.getElementById("barra-progreso-texto");
-  const btn = document.getElementById("btn-cargar-red");
+  const btnPoligono = document.getElementById("btn-cargar-red-poligono");
   let intervalo = null;
 
   function mostrarProgreso(pct, mensaje) {
     cont.classList.add("activa");
     relleno.style.width = Math.max(3, pct) + "%";
     texto.textContent = mensaje;
-    btn.disabled = true;
+    btnPoligono.disabled = true;
   }
 
   function consultarProgreso() {
@@ -160,7 +160,7 @@
           clearInterval(intervalo);
           if (data.error) {
             texto.textContent = "Error: " + data.error;
-            btn.disabled = false;
+            btnPoligono.disabled = false;
           } else {
             relleno.style.width = "100%";
             texto.textContent = (data.mensaje || "Listo.") + " Actualizando la página...";
@@ -171,9 +171,59 @@
       .catch(() => {});
   }
 
-  document.getElementById("form-cargar-red").addEventListener("submit", () => {
-    mostrarProgreso(3, "Subiendo el archivo...");
+  document.getElementById("form-cargar-red-poligono").addEventListener("submit", () => {
+    mostrarProgreso(3, "Subiendo el polígono...");
     intervalo = setInterval(consultarProgreso, 1000);
+  });
+
+  // ── Al elegir el archivo, se consulta su tabla de atributos: si trae una
+  // columna que podría separar el archivo en varias zonas, se ofrece
+  // elegirla (mismo patrón que en Ruta real) ──
+  const inputArchivosRP = document.getElementById("archivos");
+  const contColumnaRP = document.getElementById("rp-cont-columna-agrupar");
+  const selectColumnaRP = document.getElementById("rp-select-columna-agrupar");
+  inputArchivosRP.addEventListener("change", () => {
+    contColumnaRP.style.display = "none";
+    selectColumnaRP.innerHTML = "";
+    if (!inputArchivosRP.files.length) return;
+    const fd = new FormData();
+    for (const f of inputArchivosRP.files) fd.append("archivos", f);
+    fetch("{% url 'rutas:api_red_propia_columnas_poligono' %}", {
+      method: "POST",
+      headers: {"X-CSRFToken": document.querySelector("#form-cargar-red-poligono [name=csrfmiddlewaretoken]").value},
+      body: fd,
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error || !data.columnas || !data.columnas.length) return;
+        const opt0 = document.createElement("option");
+        opt0.value = "";
+        opt0.textContent = "Tratar todo como una sola zona (sin columna)";
+        selectColumnaRP.appendChild(opt0);
+        data.columnas.forEach(c => {
+          const opt = document.createElement("option");
+          opt.value = c;
+          const muestra = (data.muestras[c] || []).join(", ");
+          opt.textContent = muestra ? `${c} (ej: ${muestra})` : c;
+          selectColumnaRP.appendChild(opt);
+        });
+        contColumnaRP.style.display = "block";
+      })
+      .catch(() => {});
+  });
+
+  document.getElementById("btn-cancelar-red-poligono").addEventListener("click", () => {
+    fetch("{% url 'rutas:api_red_propia_cancelar_carga' %}", {
+      method: "POST",
+      headers: {"X-CSRFToken": document.querySelector("#form-cargar-red-poligono [name=csrfmiddlewaretoken]").value},
+    })
+      .then(() => {
+        clearInterval(intervalo);
+        cont.classList.remove("activa");
+        btnPoligono.disabled = false;
+        texto.textContent = "";
+      })
+      .catch(() => {});
   });
 
   {% if progreso.en_progreso %}
@@ -183,84 +233,220 @@
 })();
 </script>
 {% if tiene_grafo %}
-  {% if resultado %}
-    <script>
-    const resultadoRed = {{ resultado_json|safe }};
-    const lineasOriginalesRed = {{ lineas_originales_json|safe }};
-    const centro = [resultadoRed.punto_inicio_lonlat[1], resultadoRed.punto_inicio_lonlat[0]];
-    const mapaRed = L.map("mapa-red").setView(centro, 14);
+  <script>
+  const ZONAS_RP = {{ zonas_json|safe }};
+  let mapaRed = null, capaCalculadaRed = null;
+
+  function mezclarColorRP(colorA, colorB, t) {
+    const a = colorA.match(/\w\w/g).map(h => parseInt(h, 16));
+    const b = colorB.match(/\w\w/g).map(h => parseInt(h, 16));
+    const m = a.map((v, i) => Math.round(v + (b[i] - v) * t));
+    return `rgb(${m[0]},${m[1]},${m[2]})`;
+  }
+  function rumboGradosRP(p1, p2) {
+    const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+    const lat1 = toRad(p1[0]), lat2 = toRad(p2[0]), dLon = toRad(p2[1] - p1[1]);
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    return (toDeg(Math.atan2(y, x)) + 360) % 360;
+  }
+  function distanciaHaversineMRP(a, b) {
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+    const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+  function iconoFlechaAnimadaRP() {
+    return L.divIcon({
+      className: "",
+      html: `<svg class="rp-flecha-animada" width="26" height="26" viewBox="0 0 26 26"
+               style="display:block;transform:translate(-50%,-50%) rotate(0deg);
+                      filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6));">
+               <polygon points="13,3 20,18 6,18" fill="#2980B9" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+             </svg>`,
+      iconSize: [0, 0], iconAnchor: [0, 0],
+    });
+  }
+
+  // ── Estado de la animación (se reconstruye cada vez que se muestra una
+  // zona con resultado -- ver renderZonaRP) ──
+  let caminoAnimRP = [], acumuladasRP = [], distanciaTotalRP = 0, progresoRP = 0;
+  let capaTrailRP = null, markerAnimRP = null, ultimoIdxTrailRP = 0;
+  let animandoRP = false, rafRPId = null, ultimoTsRP = null;
+  let multiplicadorRP = parseFloat(document.getElementById("rp-select-velocidad").value);
+  const VELOCIDAD_BASE_RP = 22; // m/s "de pantalla" a 1x
+  const btnPlayRP = document.getElementById("rp-btn-play");
+
+  function pausarAnimacionRP() {
+    animandoRP = false;
+    if (rafRPId) cancelAnimationFrame(rafRPId);
+    btnPlayRP.textContent = "▶ Reproducir";
+  }
+
+  function posicionEnDistanciaRP(distM) {
+    if (distM <= 0) return {pos: caminoAnimRP[0], idx: 1};
+    if (distM >= distanciaTotalRP) return {pos: caminoAnimRP[caminoAnimRP.length - 1], idx: caminoAnimRP.length - 1};
+    let i = 1;
+    while (acumuladasRP[i] < distM) i++;
+    const d0 = acumuladasRP[i - 1], d1 = acumuladasRP[i];
+    const t = d1 > d0 ? (distM - d0) / (d1 - d0) : 0;
+    const p0 = caminoAnimRP[i - 1], p1 = caminoAnimRP[i];
+    return {pos: [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t], idx: i};
+  }
+
+  function moverMarcadorAnimRP(distM) {
+    const {pos, idx} = posicionEnDistanciaRP(distM);
+    markerAnimRP.setLatLng(pos);
+    const angulo = rumboGradosRP(caminoAnimRP[idx - 1], caminoAnimRP[idx]);
+    const el = markerAnimRP.getElement();
+    const flecha = el && el.querySelector(".rp-flecha-animada");
+    if (flecha) flecha.style.transform = `translate(-50%,-50%) rotate(${angulo}deg)`;
+
+    if (idx > ultimoIdxTrailRP) {
+      const tramoRecorrido = caminoAnimRP.slice(ultimoIdxTrailRP, idx + 1);
+      tramoRecorrido[tramoRecorrido.length - 1] = pos;
+      if (tramoRecorrido.length >= 2) {
+        L.polyline(tramoRecorrido, {color: "#2980B9", weight: 5, opacity: 0.9}).addTo(capaTrailRP);
+      }
+    } else if (idx <= ultimoIdxTrailRP && distM < 1) {
+      capaTrailRP.clearLayers();
+    }
+    ultimoIdxTrailRP = idx;
+  }
+
+  function pasoAnimRP(timestamp) {
+    if (ultimoTsRP === null) ultimoTsRP = timestamp;
+    const dtS = Math.min(0.25, (timestamp - ultimoTsRP) / 1000);
+    ultimoTsRP = timestamp;
+    progresoRP = Math.min(distanciaTotalRP, progresoRP + VELOCIDAD_BASE_RP * multiplicadorRP * dtS);
+    moverMarcadorAnimRP(progresoRP);
+    if (animandoRP && progresoRP < distanciaTotalRP) {
+      rafRPId = requestAnimationFrame(pasoAnimRP);
+    } else {
+      animandoRP = false;
+      btnPlayRP.textContent = "▶ Reproducir";
+    }
+  }
+
+  btnPlayRP.addEventListener("click", () => {
+    if (animandoRP) { pausarAnimacionRP(); return; }
+    if (progresoRP >= distanciaTotalRP) { progresoRP = 0; moverMarcadorAnimRP(0); }
+    animandoRP = true;
+    ultimoTsRP = null;
+    btnPlayRP.textContent = "⏸ Pausar";
+    rafRPId = requestAnimationFrame(pasoAnimRP);
+  });
+  document.getElementById("rp-select-velocidad").addEventListener("change", (e) => {
+    multiplicadorRP = parseFloat(e.target.value);
+  });
+
+  function renderZonaRP(idx) {
+    const zona = ZONAS_RP[idx];
+    document.getElementById("rp-input-zona-idx").value = idx;
+
+    const statsZona = document.getElementById("rp-stats-zona");
+    statsZona.innerHTML = `
+      <div class="stats" style="margin:0;">
+        <div class="stat"><div class="eyebrow">Calles de OSM</div><div class="val">${zona.n_lineas}</div></div>
+        <div class="stat"><div class="eyebrow">Nodos de la red</div><div class="val">${zona.nodos.length}</div></div>
+        <div class="stat ${zona.n_componentes > 1 ? "warn" : "ok"}"><div class="eyebrow">Componentes conectados</div><div class="val">${zona.n_componentes}</div></div>
+      </div>
+      ${zona.n_componentes > 1
+        ? `<div class="msg warning" style="margin-top:0.8rem;">La red tiene ${zona.n_componentes} partes NO conectadas entre sí (tamaños: ${JSON.stringify(zona.tamano_componentes.slice(0, 3))} nodos). Si el punto de inicio cae en otra parte, esas calles sueltas se excluyen.</div>`
+        : `<div class="msg success" style="margin-top:0.8rem;">✓ La red quedó como un solo componente conectado.</div>`}
+    `;
+
+    const contSin = document.getElementById("rp-cont-sin-resultado");
+    const contCon = document.getElementById("rp-cont-resultado");
+    pausarAnimacionRP();
+    if (mapaRed) { mapaRed.remove(); mapaRed = null; }
+
+    if (!zona.resultado) {
+      contSin.style.display = "block";
+      contCon.style.display = "none";
+      document.getElementById("mapa-red").style.display = "none";
+      document.getElementById("rp-controles-animacion").style.display = "none";
+      return;
+    }
+
+    document.getElementById("mapa-red").style.display = "block";
+    document.getElementById("rp-controles-animacion").style.display = "flex";
+    contSin.style.display = "none";
+    contCon.style.display = "block";
+    const r = zona.resultado;
+
+    const msgExcluidos = document.getElementById("rp-msg-nodos-excluidos");
+    if (r.nodos_excluidos) {
+      msgExcluidos.style.display = "block";
+      msgExcluidos.textContent = `La red tiene ${r.nodos_excluidos} nodo(s) fuera del componente conectado donde está el punto de inicio -- esas calles sueltas no se pudieron incluir en el recorrido.`;
+    } else {
+      msgExcluidos.style.display = "none";
+    }
+
+    document.getElementById("rp-stats-resultado").innerHTML = `
+      <div class="stat"><div class="eyebrow">Calles a cubrir</div><div class="val">${r.distancia_original_km.toFixed(2)} <small>km</small></div></div>
+      <div class="stat ${r.distancia_repetida_km > 0 ? "warn" : "ok"}"><div class="eyebrow">Repetido para cerrar el circuito</div><div class="val">${r.distancia_repetida_km.toFixed(2)} <small>km</small></div></div>
+      <div class="stat ok"><div class="eyebrow">Recorrido total</div><div class="val">${r.distancia_total_km.toFixed(2)} <small>km</small></div></div>
+    `;
+    document.getElementById("rp-caption-resultado").innerHTML = `
+      Inicio/fin: <b>${r.nombre_inicio}</b> (enganchado a ${r.distancia_enganche_km.toFixed(2)} km del punto exacto).
+      La línea del recorrido va de <span style="color:#1FA98C;">&#9632;</span> verde (inicio) a
+      <span style="color:#E67E22;">&#9632;</span> naranja (fin), con flechas que marcan el sentido.
+    `;
+
+    mapaRed = L.map("mapa-red").setView([r.punto_inicio_lonlat[1], r.punto_inicio_lonlat[0]], 14);
     mapaRed.attributionControl.setPrefix(false);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OpenStreetMap contributors"}).addTo(mapaRed);
-    const camino = resultadoRed.camino.map(p => [p[1], p[0]]);
+    const camino = r.camino.map(p => [p[1], p[0]]);
 
-    // Capa "importada": la red tal cual venía el shapefile subido, ANTES de
-    // ajustarla a calles reales -- de referencia nada más, apagada por
-    // defecto (el grafo real que se usa para calcular ya es el ajustado).
-    const capaImportada = L.layerGroup();
-    if (lineasOriginalesRed) {
-      lineasOriginalesRed.forEach(linea => {
-        if (linea.length < 2) return;
-        L.polyline(linea.map(p => [p[1], p[0]]), {color: "#E53935", weight: 3, opacity: 0.85}).addTo(capaImportada);
-      });
-    }
-
-    // Capa "calculada": el recorrido de cobertura total, ya ajustado a
-    // calles reales (OSM) desde que se cargó la red. Degradado de color
-    // verde (inicio) -> naranja (fin) para que se note el SENTIDO del
-    // recorrido, más flechas de dirección.
-    const capaCalculada = L.layerGroup();
-    function mezclarColor(colorA, colorB, t) {
-      const a = colorA.match(/\w\w/g).map(h => parseInt(h, 16));
-      const b = colorB.match(/\w\w/g).map(h => parseInt(h, 16));
-      const m = a.map((v, i) => Math.round(v + (b[i] - v) * t));
-      return `rgb(${m[0]},${m[1]},${m[2]})`;
-    }
+    capaCalculadaRed = L.layerGroup();
     const COLOR_INICIO = "1FA98C", COLOR_FIN = "E67E22";
     const N_TRAMOS_COLOR = Math.min(40, camino.length - 1);
     const pasoColor = Math.max(1, Math.floor((camino.length - 1) / N_TRAMOS_COLOR));
-    let boundsAcumulados = null;
+    let bounds = null;
     for (let i = 0; i < camino.length - 1; i += pasoColor) {
       const fin = Math.min(i + pasoColor, camino.length - 1);
       const tramo = camino.slice(i, fin + 1);
       if (tramo.length < 2) continue;
       const t = i / (camino.length - 1);
-      const linea = L.polyline(tramo, {color: mezclarColor(COLOR_INICIO, COLOR_FIN, t), weight: 4, opacity: 0.85}).addTo(capaCalculada);
-      boundsAcumulados = boundsAcumulados ? boundsAcumulados.extend(linea.getBounds()) : linea.getBounds();
+      const linea = L.polyline(tramo, {color: mezclarColorRP(COLOR_INICIO, COLOR_FIN, t), weight: 4, opacity: 0.85}).addTo(capaCalculadaRed);
+      bounds = bounds ? bounds.extend(linea.getBounds()) : linea.getBounds();
     }
 
-    // Flechas de dirección a lo largo del recorrido, espaciadas por índice
-    // (no por distancia) para no saturar el mapa sin importar el tamaño de la red.
-    function rumboGrados(p1, p2) {
-      const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
-      const lat1 = toRad(p1[0]), lat2 = toRad(p2[0]), dLon = toRad(p2[1] - p1[1]);
-      const y = Math.sin(dLon) * Math.cos(lat2);
-      const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
-      return (toDeg(Math.atan2(y, x)) + 360) % 360;
-    }
     const N_FLECHAS = Math.min(60, camino.length - 1);
     const pasoFlecha = Math.max(1, Math.floor((camino.length - 1) / N_FLECHAS));
     for (let i = pasoFlecha; i < camino.length; i += pasoFlecha) {
-      const anterior = camino[i - 1], actual = camino[i];
-      const angulo = rumboGrados(anterior, actual);
+      const angulo = rumboGradosRP(camino[i - 1], camino[i]);
       const icono = L.divIcon({
         className: "flecha-red-propia",
         html: `<div style="transform:rotate(${angulo}deg);font-size:14px;line-height:14px;color:#fff;text-shadow:0 0 2px #000,0 0 2px #000,0 0 3px #000;">&#9650;</div>`,
         iconSize: [14, 14], iconAnchor: [7, 7],
       });
-      L.marker(actual, {icon: icono, interactive: false}).addTo(capaCalculada);
+      L.marker(camino[i], {icon: icono, interactive: false}).addTo(capaCalculadaRed);
     }
-    L.marker(centro).addTo(capaCalculada)
-      .bindPopup(`Inicio/fin: ${resultadoRed.nombre_inicio}`)
-      .bindTooltip(resultadoRed.nombre_inicio);
+    L.marker([r.punto_inicio_lonlat[1], r.punto_inicio_lonlat[0]]).addTo(capaCalculadaRed)
+      .bindPopup(`Inicio/fin: ${r.nombre_inicio}`)
+      .bindTooltip(r.nombre_inicio);
 
-    capaImportada.addTo(mapaRed);
-    capaCalculada.addTo(mapaRed);
-    L.control.layers(null, {
-      "Recorrido calculado": capaCalculada,
-      "Red importada (shapefile original)": capaImportada,
-    }, {collapsed: false}).addTo(mapaRed);
+    capaCalculadaRed.addTo(mapaRed);
+    if (bounds) mapaRed.fitBounds(bounds);
 
-    if (boundsAcumulados) mapaRed.fitBounds(boundsAcumulados);
+    // ── Animación: flecha que recorre el camino, marcando en azul lo ya
+    // recorrido -- mismo patrón que Ruta real ──
+    caminoAnimRP = camino;
+    acumuladasRP = [0];
+    for (let i = 1; i < caminoAnimRP.length; i++) {
+      acumuladasRP.push(acumuladasRP[i - 1] + distanciaHaversineMRP(caminoAnimRP[i - 1], caminoAnimRP[i]));
+    }
+    distanciaTotalRP = acumuladasRP[acumuladasRP.length - 1];
+    progresoRP = 0;
+    ultimoIdxTrailRP = 0;
+
+    capaTrailRP = L.layerGroup().addTo(mapaRed);
+    markerAnimRP = L.marker(caminoAnimRP[0], {icon: iconoFlechaAnimadaRP(), interactive: false}).addTo(mapaRed);
+    moverMarcadorAnimRP(0);
 
     (function agregarPantallaCompleta(mapaLeaflet) {
       const FullscreenControl = L.Control.extend({
@@ -287,8 +473,13 @@
       });
       mapaLeaflet.addControl(new FullscreenControl());
     })(mapaRed);
-    </script>
-  {% endif %}
+  }
+
+  document.getElementById("rp-select-zona").addEventListener("change", (e) => {
+    renderZonaRP(parseInt(e.target.value, 10));
+  });
+  renderZonaRP({{ zona_idx_inicial }});
+  </script>
 
   <script>
   const datosIniciales = {{ puntos_json|safe }};
@@ -320,9 +511,17 @@
 
   document.getElementById("form-calcular-red").addEventListener("submit", () => {
     const btn = document.getElementById("btn-calcular-red");
+    const btnAuto = document.getElementById("btn-calcular-red-auto");
     const estado = document.getElementById("estado-calculo-red");
-    btn.disabled = true;
-    btn.textContent = "Calculando...";
+    // Deshabilitar el botón DENTRO de su propio submit lo excluye de los
+    // datos enviados (los controles disabled no se mandan) -- se difiere
+    // con setTimeout para que la navegación ya haya arrancado con el
+    // "auto_inicio=1" del botón que se clickeó incluido.
+    setTimeout(() => {
+      btn.disabled = true;
+      btnAuto.disabled = true;
+      btn.textContent = "Calculando...";
+    }, 0);
     estado.textContent = "Puede tardar varios segundos en redes grandes — no cierres esta página.";
   });
   </script>

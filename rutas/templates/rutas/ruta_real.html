@@ -1,0 +1,468 @@
+{% extends "rutas/_base.html" %}
+{% load static %}
+{% block title %}Ruta real — Optimizador de Rutas{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  #mapa-ruta-real { height: 520px; border-radius: 0 0 10px 10px; }
+  #mapa-ruta-real:fullscreen { width: 100%; height: 100%; }
+  .barra-progreso-cont { display: none; margin-top: 0.8rem; }
+  .barra-progreso-cont.activa { display: block; }
+  .barra-progreso-pista { background: rgba(127,127,127,0.25); border-radius: 999px; height: 10px; overflow: hidden; }
+  .barra-progreso-relleno { background: #1FA98C; height: 100%; width: 0%; transition: width 0.4s ease; }
+  .barra-progreso-texto { margin-top: 0.4rem; }
+  .rr-controles { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Ruta real <span class="chip warn" style="vertical-align:middle;">Beta</span></h1>
+    <div class="sub">
+      Independiente de Red propia (que calcula la mejor cobertura de una red genérica de calles) y del
+      optimizador principal. Acá subís el shapefile de una ruta que YA existe -- el recorrido real que
+      hace un camión hoy -- y la app encadena los tramos en recorridos continuos (si el archivo trae
+      varias rutas o zonas mezcladas, las separa en vez de forzarlas juntas), los ajusta a calles reales
+      (OSM) y te los muestra animados, tal cual los hacen.
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>1. Subí tu ruta</h2></div>
+  <div class="card-body">
+    <p class="caption" style="margin-top:0;">
+      Formatos aceptados: <b>(A)</b> un .zip con el shapefile adentro, <b>(B)</b> los archivos
+      .shp + .shx + .dbf sueltos, <b>(C)</b> un .geojson, o <b>(D)</b> un .gpkg. Los tramos pueden venir
+      en cualquier orden -- el sistema los reconecta solo.
+    </p>
+    <form method="post" action="{% url 'rutas:api_ruta_real_cargar' %}" enctype="multipart/form-data" id="form-cargar-ruta-real">
+      {% csrf_token %}
+      <label for="nombre_carga">Nombre para esta carga</label>
+      <input type="text" id="nombre_carga" name="nombre" maxlength="150" placeholder="ej. Sector Centro - marzo 2026">
+      <label for="archivos" style="margin-top:0.8rem;">Capa de líneas (la ruta real)</label>
+      <input type="file" id="archivos" name="archivos" multiple accept=".zip,.shp,.shx,.dbf,.prj,.geojson,.json,.gpkg">
+      <div id="rr-cont-columna-agrupar" style="display:none; margin-top:0.8rem;">
+        <label for="rr-select-columna-agrupar">¿Alguna columna de la tabla de atributos indica a qué ruta/día pertenece cada tramo?</label>
+        <select name="columna_agrupar" id="rr-select-columna-agrupar"></select>
+      </div>
+      <button type="submit" class="btn primary" id="btn-cargar-ruta-real" style="margin-top:1rem;">Cargar ruta</button>
+      <span id="estado-carga-ruta-real" class="caption" style="margin-left:0.6rem;"></span>
+      <div class="barra-progreso-cont {% if progreso.en_progreso %}activa{% endif %}" id="barra-progreso-cont">
+        <div class="barra-progreso-pista"><div class="barra-progreso-relleno" id="barra-progreso-relleno"></div></div>
+        <p class="caption barra-progreso-texto" id="barra-progreso-texto">{{ progreso.mensaje }}</p>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if cargas %}
+<div class="card">
+  <div class="card-head"><h2>2. Cargas guardadas</h2></div>
+  <div class="card-body">
+    <div class="rr-controles" style="margin-bottom:0.8rem;">
+      <label for="rr-select-carga" style="margin:0;">Viendo:</label>
+      <select id="rr-select-carga">
+        {% for c in cargas %}
+          <option value="{{ c.pk }}" {% if carga_activa and c.pk == carga_activa.pk %}selected{% endif %}>{{ c.nombre }} — {{ c.creado|date:"d/m/Y H:i" }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% if carga_activa %}
+      <form method="post" action="{% url 'rutas:api_ruta_real_eliminar' carga_activa.pk %}" onsubmit="return confirm('¿Eliminar la carga «{{ carga_activa.nombre }}»? No se puede deshacer.');">
+        {% csrf_token %}
+        <button type="submit" class="btn" style="color:var(--danger);border-color:var(--danger);">Eliminar esta carga</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% if tiene_ruta %}
+  <div class="stats">
+    <div class="stat"><div class="eyebrow">Tramos de línea (archivo)</div><div class="val">{{ carga_activa.n_lineas }}</div></div>
+    <div class="stat {% if carga_activa.rutas_json|length > 1 %}warn{% else %}ok{% endif %}"><div class="eyebrow">Rutas separadas detectadas</div><div class="val">{{ carga_activa.rutas_json|length }}</div></div>
+  </div>
+  {% if carga_activa.rutas_json|length > 1 %}
+    <div class="msg warning">
+      El archivo trae {{ carga_activa.rutas_json|length }} grupos de tramos sin conexión real entre sí
+      (probablemente zonas, días o camiones distintos) -- se separaron en rutas independientes en vez de
+      forzarlas en un solo recorrido. Elegí cuál ver abajo.
+    </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-head">
+      <h2>3. Resultado</h2>
+      <div class="rr-controles">
+        <select id="rr-select-ruta" title="Qué ruta mostrar">
+          {% for r in carga_activa.rutas_json %}
+            <option value="{{ forloop.counter0 }}">{% if r.etiqueta %}{{ r.etiqueta }}{% else %}Ruta {{ forloop.counter }}{% endif %} — {{ r.distancia_km|floatformat:2 }} km</option>
+          {% endfor %}
+        </select>
+        <button class="btn" type="button" id="rr-btn-play">▶ Reproducir</button>
+        <select id="rr-select-velocidad" title="Velocidad de la animación">
+          <option value="1">1x</option>
+          <option value="5">5x</option>
+          <option value="10" selected>10x</option>
+          <option value="25">25x</option>
+          <option value="50">50x</option>
+        </select>
+        <a class="btn" id="rr-link-exportar-gpx" href="#" download>Exportar GPX</a>
+        <a class="btn" id="rr-link-exportar-kml" href="#" download>Exportar KML</a>
+      </div>
+    </div>
+    <div class="card-body">
+      <p class="caption" style="margin:0;">
+        La línea del recorrido va de <span style="color:#1FA98C;">&#9632;</span> verde (inicio) a
+        <span style="color:#E67E22;">&#9632;</span> naranja (fin), con flechas que marcan el sentido. El
+        trazo <span style="color:#2980B9;">&#9632;</span> azul es lo que YA recorrió la flecha. Los tramos
+        <span style="color:#9E9E9E;">&#9632;</span> grises punteados son huecos del archivo original
+        (donde no había calle digitalizada) puenteados en línea recta. La capa
+        <span style="color:#E53935;">&#9632;</span> roja (activable arriba a la derecha del mapa) es la
+        ruta tal cual venía el archivo, antes de ajustarla.
+      </p>
+    </div>
+    <div class="card-body" id="rr-stats-ruta" style="padding-top:0;"></div>
+    <div class="card-body flush">
+      <div id="mapa-ruta-real"></div>
+    </div>
+  </div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const cont = document.getElementById("barra-progreso-cont");
+  const relleno = document.getElementById("barra-progreso-relleno");
+  const texto = document.getElementById("barra-progreso-texto");
+  const btn = document.getElementById("btn-cargar-ruta-real");
+  let intervalo = null;
+
+  function mostrarProgreso(pct, mensaje) {
+    cont.classList.add("activa");
+    relleno.style.width = Math.max(3, pct) + "%";
+    texto.textContent = mensaje;
+    btn.disabled = true;
+  }
+
+  function consultarProgreso() {
+    fetch("{% url 'rutas:api_ruta_real_progreso' %}")
+      .then(r => r.json())
+      .then(data => {
+        if (data.en_progreso) {
+          const pct = data.lineas_total ? (data.lineas_hechas / data.lineas_total) * 100 : 5;
+          mostrarProgreso(pct, data.mensaje || "Cargando...");
+        } else {
+          clearInterval(intervalo);
+          if (data.error) {
+            texto.textContent = "Error: " + data.error;
+            btn.disabled = false;
+          } else {
+            relleno.style.width = "100%";
+            texto.textContent = (data.mensaje || "Listo.") + " Actualizando la página...";
+            setTimeout(() => window.location.reload(), 600);
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
+  document.getElementById("form-cargar-ruta-real").addEventListener("submit", () => {
+    mostrarProgreso(3, "Subiendo el archivo...");
+    intervalo = setInterval(consultarProgreso, 1000);
+  });
+
+  // ── Al elegir el archivo, se consulta su tabla de atributos: si trae una
+  // columna que podría indicar a qué ruta/día pertenece cada tramo, se
+  // ofrece elegirla (más confiable que agrupar por cercanía) ──
+  const inputArchivosRR = document.getElementById("archivos");
+  const contColumnaRR = document.getElementById("rr-cont-columna-agrupar");
+  const selectColumnaRR = document.getElementById("rr-select-columna-agrupar");
+  inputArchivosRR.addEventListener("change", () => {
+    contColumnaRR.style.display = "none";
+    selectColumnaRR.innerHTML = "";
+    if (!inputArchivosRR.files.length) return;
+    const fd = new FormData();
+    for (const f of inputArchivosRR.files) fd.append("archivos", f);
+    fetch("{% url 'rutas:api_ruta_real_columnas' %}", {
+      method: "POST",
+      headers: {"X-CSRFToken": document.querySelector("#form-cargar-ruta-real [name=csrfmiddlewaretoken]").value},
+      body: fd,
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error || !data.columnas || !data.columnas.length) return;
+        const opt0 = document.createElement("option");
+        opt0.value = "";
+        opt0.textContent = "Agrupar por cercanía automáticamente (sin columna)";
+        selectColumnaRR.appendChild(opt0);
+        data.columnas.forEach(c => {
+          const opt = document.createElement("option");
+          opt.value = c;
+          const muestra = (data.muestras[c] || []).join(", ");
+          opt.textContent = muestra ? `${c} (ej: ${muestra})` : c;
+          selectColumnaRR.appendChild(opt);
+        });
+        contColumnaRR.style.display = "block";
+      })
+      .catch(() => {});
+  });
+
+  {% if progreso.en_progreso %}
+  mostrarProgreso({% widthratio progreso.lineas_hechas progreso.lineas_total 100 %}, "{{ progreso.mensaje|escapejs }}");
+  intervalo = setInterval(consultarProgreso, 1000);
+  {% endif %}
+
+  const selectCargaRR = document.getElementById("rr-select-carga");
+  if (selectCargaRR) {
+    selectCargaRR.addEventListener("change", (e) => {
+      window.location.href = "?carga=" + e.target.value;
+    });
+  }
+})();
+</script>
+
+{% if tiene_ruta %}
+<script>
+const RUTAS_RR = {{ rutas_json|safe }};
+const UMBRAL_SALTO_VISUAL_M = 150; // para marcar tramos "puente" (huecos del archivo) en el dibujo
+const CARGA_ID_RR = {{ carga_activa.pk }};
+const URL_EXPORTAR_BASE_RR = "{% url 'rutas:api_ruta_real_exportar' carga_activa.pk 0 'FORMATO' %}";
+
+const mapaRR = L.map("mapa-ruta-real").setView([9.9, -84.1], 13);
+mapaRR.attributionControl.setPrefix(false);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OpenStreetMap contributors"}).addTo(mapaRR);
+
+function distanciaHaversineMRR(a, b) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+  const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function rumboGradosRR(p1, p2) {
+  const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+  const lat1 = toRad(p1[0]), lat2 = toRad(p2[0]), dLon = toRad(p2[1] - p1[1]);
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function mezclarColorRR(colorA, colorB, t) {
+  const a = colorA.match(/\w\w/g).map(h => parseInt(h, 16));
+  const b = colorB.match(/\w\w/g).map(h => parseInt(h, 16));
+  const m = a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  return `rgb(${m[0]},${m[1]},${m[2]})`;
+}
+function iconoFlechaRR() {
+  return L.divIcon({
+    className: "",
+    html: `<svg class="rr-flecha" width="26" height="26" viewBox="0 0 26 26"
+             style="display:block;transform:translate(-50%,-50%) rotate(0deg);
+                    filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6));">
+             <polygon points="13,3 20,18 6,18" fill="#2980B9" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+           </svg>`,
+    iconSize: [0, 0], iconAnchor: [0, 0],
+  });
+}
+
+// ── Estado de la ruta actualmente mostrada (se reconstruye al cambiar de ruta) ──
+let caminoAjustado = [], acumuladasRR = [], distanciaTotalRR = 0, progresoRR = 0;
+let capaOriginalRR = null, capaCalculadaRR = null, capaTrailRR = null, markerRR = null, layersControlRR = null;
+let animandoRR = false, rafRRId = null, ultimoTsRR = null;
+let multiplicadorRR = parseFloat(document.getElementById("rr-select-velocidad").value);
+const btnPlayRR = document.getElementById("rr-btn-play");
+const statsRutaRR = document.getElementById("rr-stats-ruta");
+
+function pausarRR() {
+  animandoRR = false;
+  if (rafRRId) cancelAnimationFrame(rafRRId);
+  btnPlayRR.textContent = "▶ Reproducir";
+}
+
+function urlExportarRR(idx, formato) {
+  return URL_EXPORTAR_BASE_RR.replace("/0/exportar/FORMATO/", `/${idx}/exportar/${formato}/`);
+}
+
+function cargarRutaRR(idx) {
+  pausarRR();
+  const r = RUTAS_RR[idx];
+  caminoAjustado = r.camino.map(p => [p[1], p[0]]);
+  const caminoOriginal = r.camino_original ? r.camino_original.map(p => [p[1], p[0]]) : [];
+
+  document.getElementById("rr-link-exportar-gpx").href = urlExportarRR(idx, "gpx");
+  document.getElementById("rr-link-exportar-kml").href = urlExportarRR(idx, "kml");
+
+  if (capaOriginalRR) mapaRR.removeLayer(capaOriginalRR);
+  if (capaCalculadaRR) mapaRR.removeLayer(capaCalculadaRR);
+  if (capaTrailRR) mapaRR.removeLayer(capaTrailRR);
+  if (markerRR) mapaRR.removeLayer(markerRR);
+  if (layersControlRR) mapaRR.removeControl(layersControlRR);
+
+  // ── Capa "importada": la ruta cruda tal cual venía el archivo ──
+  capaOriginalRR = L.layerGroup();
+  if (caminoOriginal.length >= 2) {
+    L.polyline(caminoOriginal, {color: "#E53935", weight: 3, opacity: 0.85}).addTo(capaOriginalRR);
+  }
+
+  // ── Capa "calculada": degradado verde->naranja, con los tramos "puente"
+  // (huecos reales del archivo original que no se pudieron matchear a una
+  // calle real) marcados aparte, punteados en gris, para que no se
+  // confundan con calle real ──
+  capaCalculadaRR = L.layerGroup();
+  const COLOR_INICIO_RR = "1FA98C", COLOR_FIN_RR = "E67E22";
+  const N_TRAMOS_COLOR_RR = Math.min(40, caminoAjustado.length - 1);
+  const pasoColorRR = Math.max(1, Math.floor((caminoAjustado.length - 1) / N_TRAMOS_COLOR_RR));
+  let boundsRR = null;
+  for (let i = 0; i < caminoAjustado.length - 1; i += pasoColorRR) {
+    const fin = Math.min(i + pasoColorRR, caminoAjustado.length - 1);
+    const tramo = caminoAjustado.slice(i, fin + 1);
+    if (tramo.length < 2) continue;
+    const t = i / (caminoAjustado.length - 1);
+    const linea = L.polyline(tramo, {color: mezclarColorRR(COLOR_INICIO_RR, COLOR_FIN_RR, t), weight: 4, opacity: 0.85}).addTo(capaCalculadaRR);
+    boundsRR = boundsRR ? boundsRR.extend(linea.getBounds()) : linea.getBounds();
+  }
+  // tramos "puente": cualquier salto grande entre puntos consecutivos del
+  // camino ajustado -- se dibujan encima, punteados, para que se note que
+  // no son calle real sino un hueco del archivo original.
+  for (let i = 0; i < caminoAjustado.length - 1; i++) {
+    if (distanciaHaversineMRR(caminoAjustado[i], caminoAjustado[i + 1]) > UMBRAL_SALTO_VISUAL_M) {
+      L.polyline([caminoAjustado[i], caminoAjustado[i + 1]], {
+        color: "#9E9E9E", weight: 3, opacity: 0.9, dashArray: "6 6",
+      }).addTo(capaCalculadaRR);
+    }
+  }
+
+  capaTrailRR = L.layerGroup();
+
+  capaOriginalRR.addTo(mapaRR);
+  capaCalculadaRR.addTo(mapaRR);
+  capaTrailRR.addTo(mapaRR);
+  layersControlRR = L.control.layers(null, {
+    "Recorrido ajustado": capaCalculadaRR,
+    "Ya recorrido (animación)": capaTrailRR,
+    "Ruta importada (archivo original)": capaOriginalRR,
+  }, {collapsed: false}).addTo(mapaRR);
+  if (boundsRR) mapaRR.fitBounds(boundsRR);
+
+  acumuladasRR = [0];
+  for (let i = 1; i < caminoAjustado.length; i++) {
+    acumuladasRR.push(acumuladasRR[i - 1] + distanciaHaversineMRR(caminoAjustado[i - 1], caminoAjustado[i]));
+  }
+  distanciaTotalRR = acumuladasRR[acumuladasRR.length - 1];
+  progresoRR = 0;
+
+  markerRR = L.marker(caminoAjustado[0], {icon: iconoFlechaRR(), interactive: false}).addTo(mapaRR);
+  moverMarcadorRR(0);
+
+  const nSaltos = r.saltos ? r.saltos.length : 0;
+  statsRutaRR.innerHTML = `
+    <div class="stats" style="margin:0;">
+      <div class="stat"><div class="eyebrow">Tramos encadenados</div><div class="val">${r.n_tramos_total}</div></div>
+      <div class="stat ok"><div class="eyebrow">Distancia</div><div class="val">${r.distancia_km.toFixed(2)} <small>km</small></div></div>
+      <div class="stat ${r.n_tramos_ajustados < r.n_tramos_total ? "warn" : "ok"}"><div class="eyebrow">Ajustados a OSM</div><div class="val">${r.n_tramos_ajustados}<small> / ${r.n_tramos_total}</small></div></div>
+      <div class="stat ${nSaltos ? "warn" : "ok"}"><div class="eyebrow">Huecos puenteados</div><div class="val">${nSaltos}</div></div>
+    </div>`;
+}
+
+function posicionEnDistanciaRR(distM) {
+  if (distM <= 0) return {pos: caminoAjustado[0], idx: 1};
+  if (distM >= distanciaTotalRR) return {pos: caminoAjustado[caminoAjustado.length - 1], idx: caminoAjustado.length - 1};
+  let i = 1;
+  while (acumuladasRR[i] < distM) i++;
+  const d0 = acumuladasRR[i - 1], d1 = acumuladasRR[i];
+  const t = d1 > d0 ? (distM - d0) / (d1 - d0) : 0;
+  const p0 = caminoAjustado[i - 1], p1 = caminoAjustado[i];
+  return {pos: [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t], idx: i};
+}
+
+let ultimoIdxTrailRR = 0;
+function moverMarcadorRR(distM) {
+  const {pos, idx} = posicionEnDistanciaRR(distM);
+  markerRR.setLatLng(pos);
+  const angulo = rumboGradosRR(caminoAjustado[idx - 1], caminoAjustado[idx]);
+  const el = markerRR.getElement();
+  const flecha = el && el.querySelector(".rr-flecha");
+  if (flecha) flecha.style.transform = `translate(-50%,-50%) rotate(${angulo}deg)`;
+
+  // ── Trail: pinta en azul el tramo recién recorrido desde el último frame ──
+  if (idx > ultimoIdxTrailRR) {
+    const tramoRecorrido = caminoAjustado.slice(ultimoIdxTrailRR, idx + 1);
+    tramoRecorrido[tramoRecorrido.length - 1] = pos;
+    if (tramoRecorrido.length >= 2) {
+      L.polyline(tramoRecorrido, {color: "#2980B9", weight: 5, opacity: 0.9}).addTo(capaTrailRR);
+    }
+  } else if (idx <= ultimoIdxTrailRR && distM < 1) {
+    capaTrailRR.clearLayers(); // se reinició la animación desde el principio
+  }
+  ultimoIdxTrailRR = idx;
+}
+
+document.getElementById("rr-select-ruta").addEventListener("change", (e) => {
+  cargarRutaRR(parseInt(e.target.value, 10));
+});
+cargarRutaRR(0);
+
+(function agregarPantallaCompletaRR(mapaLeaflet) {
+  const FullscreenControl = L.Control.extend({
+    options: {position: "topright"},
+    onAdd: function () {
+      const b = L.DomUtil.create("button", "leaflet-bar leaflet-control leaflet-control-fullscreen");
+      b.type = "button"; b.title = "Pantalla completa";
+      b.style.width = "30px"; b.style.height = "30px";
+      const actualizarIcono = () => { b.innerHTML = document.fullscreenElement ? "✕" : "⛶"; };
+      actualizarIcono();
+      L.DomEvent.on(b, "click", (e) => {
+        L.DomEvent.stop(e);
+        if (!document.fullscreenElement) mapaLeaflet.getContainer().requestFullscreen();
+        else document.exitFullscreen();
+      });
+      document.addEventListener("fullscreenchange", () => { actualizarIcono(); setTimeout(() => mapaLeaflet.invalidateSize(), 100); });
+      L.DomEvent.disableClickPropagation(b);
+      return b;
+    },
+  });
+  mapaLeaflet.addControl(new FullscreenControl());
+})(mapaRR);
+
+// ── Animación: un ícono de flecha que recorre el camino AJUSTADO (estado y
+// funciones de soporte ya declarados más arriba, junto con cargarRutaRR) ──
+const VELOCIDAD_BASE_RR = 22; // m/s "de pantalla" a 1x
+
+function pasoRR(timestamp) {
+  if (ultimoTsRR === null) ultimoTsRR = timestamp;
+  const dtS = Math.min(0.25, (timestamp - ultimoTsRR) / 1000);
+  ultimoTsRR = timestamp;
+  progresoRR = Math.min(distanciaTotalRR, progresoRR + VELOCIDAD_BASE_RR * multiplicadorRR * dtS);
+  moverMarcadorRR(progresoRR);
+  if (animandoRR && progresoRR < distanciaTotalRR) {
+    rafRRId = requestAnimationFrame(pasoRR);
+  } else {
+    animandoRR = false;
+    btnPlayRR.textContent = "▶ Reproducir";
+  }
+}
+
+btnPlayRR.addEventListener("click", () => {
+  if (animandoRR) {
+    animandoRR = false;
+    if (rafRRId) cancelAnimationFrame(rafRRId);
+    btnPlayRR.textContent = "▶ Reproducir";
+    return;
+  }
+  if (progresoRR >= distanciaTotalRR) { progresoRR = 0; moverMarcadorRR(0); }
+  animandoRR = true;
+  ultimoTsRR = null;
+  btnPlayRR.textContent = "⏸ Pausar";
+  rafRRId = requestAnimationFrame(pasoRR);
+});
+document.getElementById("rr-select-velocidad").addEventListener("change", (e) => {
+  multiplicadorRR = parseFloat(e.target.value);
+});
+</script>
+{% endif %}
+{% endblock %}

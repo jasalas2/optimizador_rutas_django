@@ -172,24 +172,23 @@ class CostosGenerales(models.Model):
 
 
 class RedPropiaGrafo(models.Model):
-    """Fila única (singleton, siempre pk=1) — grafo (networkx) construido a
-    partir del shapefile de líneas subido por el usuario. No se puede guardar
-    un networkx.Graph directamente en JSON, así que se serializa como nodos
-    (lon, lat) + aristas (a, b, peso_m); se reconstruye el Graph en memoria
-    cada vez que hace falta. Reemplaza st.session_state.red_propia_grafo."""
-    nodos_json = models.JSONField(null=True, blank=True)
-    aristas_json = models.JSONField(null=True, blank=True)
-    n_lineas = models.IntegerField(default=0)
-    n_componentes = models.IntegerField(default=0)
-    tamano_componentes_json = models.JSONField(default=list, blank=True)
-
-    # Geometría CRUDA tal como venía el shapefile subido (antes de ajustarla
-    # a calles reales vía OSRM) -- se guarda aparte solo para poder
-    # mostrarla de referencia en el mapa ("capa importada"); el grafo de
-    # arriba (nodos_json/aristas_json) ya es el AJUSTADO, el que se usa
-    # para calcular cualquier recorrido.
-    lineas_originales_json = models.JSONField(null=True, blank=True)
-    n_lineas_ajustadas = models.IntegerField(default=0)
+    """Fila única (singleton, siempre pk=1) — una o varias ZONAS/sectores de
+    recolección (subidas como polígono), cada una con su propio grafo de
+    calles reales de OpenStreetMap y su propio resultado de cobertura
+    calculado. Un networkx.Graph no se puede guardar directamente en JSON,
+    así que cada zona serializa su grafo como nodos (lon, lat) + aristas
+    (a, b, peso_m); se reconstruye el Graph en memoria cada vez que hace
+    falta (ver rutas.views._grafo_desde_bd)."""
+    zonas_json = models.JSONField(default=list, blank=True)
+    # zonas_json: lista de {
+    #   "etiqueta": str|None (valor de la columna de atributo elegida, o
+    #     None si el archivo se trató como una sola zona),
+    #   "nodos": [[lon,lat],...], "aristas": [[a,b,peso_m],...],
+    #   "n_lineas": int (calles de OSM descargadas), "n_componentes": int,
+    #   "tamano_componentes": [...],
+    #   "resultado": {...}|None (resultado de cobertura calculado para esta
+    #     zona, None hasta que se calcule),
+    # }
 
     @classmethod
     def cargar(cls):
@@ -202,26 +201,28 @@ class RedPropiaGrafo(models.Model):
 
 
 class RedPropiaCargaProgreso(models.Model):
-    """Fila única (singleton, siempre pk=1) -- estado del ajuste a OSRM que
-    corre en un hilo de fondo al cargar una red (ver
-    rutas.views._cargar_red_en_segundo_plano). El navegador consulta este
-    estado cada 1s (api_red_propia_progreso) para dibujar una barra de
-    progreso real, en vez de dejar al usuario esperando una petición HTTP
-    sin ninguna señal de que sigue viva."""
+    """Fila única (singleton, siempre pk=1) -- estado de la descarga de
+    calles de OSM (por zona) que corre en un hilo de fondo al cargar un
+    polígono (ver rutas.views._cargar_red_desde_poligono_en_segundo_plano).
+    El navegador consulta este estado cada 1s (api_red_propia_progreso)
+    para dibujar una barra de progreso real, en vez de dejar al usuario
+    esperando una petición HTTP sin ninguna señal de que sigue viva."""
     en_progreso = models.BooleanField(default=False)
     lineas_total = models.IntegerField(default=0)
     lineas_hechas = models.IntegerField(default=0)
     mensaje = models.CharField(max_length=300, blank=True, default="")
     error = models.CharField(max_length=500, blank=True, default="")
 
-    @classmethod
-    def cargar(cls):
-        obj, _ = cls.objects.get_or_create(pk=1)
-        return obj
-
-    def save(self, *args, **kwargs):
-        self.pk = 1
-        super().save(*args, **kwargs)
+    # Se incrementa cada vez que arranca una carga nueva (o que el usuario
+    # cancela una en curso). El hilo de fondo guarda el valor vigente al
+    # arrancar y lo revisa entre zona y zona -- si ya no coincide (porque se
+    # canceló o se lanzó otra carga encima), corta ahí sin guardar nada más.
+    # Un hilo de Python no se puede matar a la fuerza si está esperando una
+    # respuesta de red (Overpass puede tardar minutos), así que esto es
+    # "cancelación cooperativa": no interrumpe la consulta ya en vuelo, pero
+    # libera la pantalla al toque y evita que ese resultado viejo pise una
+    # carga nueva.
+    version = models.IntegerField(default=0)
 
     @classmethod
     def cargar(cls):
@@ -246,21 +247,6 @@ class RedPropiaPunto(models.Model):
 
     def __str__(self):
         return self.nombre
-
-
-class RedPropiaResultado(models.Model):
-    """Fila única (singleton, siempre pk=1) — último resultado calculado
-    sobre la red propia."""
-    resultado_json = models.JSONField(null=True, blank=True)
-
-    @classmethod
-    def cargar(cls):
-        obj, _ = cls.objects.get_or_create(pk=1)
-        return obj
-
-    def save(self, *args, **kwargs):
-        self.pk = 1
-        super().save(*args, **kwargs)
 
 
 class TasaViaKgKm(models.Model):
@@ -307,3 +293,53 @@ class Punto(models.Model):
 
     def __str__(self):
         return self.nombre
+
+
+class RutaRealCarga(models.Model):
+    """Una carga guardada de Ruta real -- una o varias rutas REALES (no una
+    red genérica de calles) subidas como shapefile: los tramos sueltos se
+    separan en grupos conectados entre sí (ver core.encadenar_en_subrutas /
+    core.encadenar_rutas_reales -- un shapefile municipal real suele traer
+    varias rutas/zonas/días distintos mezclados, sin forzarlos a una sola)
+    y cada grupo se ajusta a calles reales de OSM por separado.
+
+    A diferencia de RedPropiaGrafo (todavía singleton), cada carga acá es
+    una fila propia -- subir un archivo nuevo NO pisa el anterior, quedan
+    todos guardados y elegibles por nombre. Sección "Red propia — Ruta
+    real", independiente de RedPropiaGrafo (cobertura total / Cartero
+    Chino) y del modelo principal."""
+    nombre = models.CharField(max_length=150)
+    creado = models.DateTimeField(auto_now_add=True)
+    n_lineas = models.IntegerField(default=0)  # total de tramos de línea del archivo subido
+    rutas_json = models.JSONField(default=list, blank=True)
+    # rutas_json: lista de {"camino": [(lon,lat),...] ajustado, "camino_original":
+    # [(lon,lat),...] crudo, "distancia_km": float, "n_tramos_ajustados": int,
+    # "n_tramos_total": int, "saltos": [...], "etiqueta": str|None}, ordenada
+    # de más a menos larga.
+
+    class Meta:
+        ordering = ["-creado"]
+
+    def __str__(self):
+        return self.nombre
+
+
+class RutaRealProgreso(models.Model):
+    """Fila única (singleton, siempre pk=1) -- estado del encadenado +
+    ajuste a OSRM de una Ruta real, que corre en un hilo de fondo. Mismo
+    patrón que RedPropiaCargaProgreso, tabla aparte para no compartir
+    estado con la carga de Red propia (cobertura total)."""
+    en_progreso = models.BooleanField(default=False)
+    lineas_total = models.IntegerField(default=0)
+    lineas_hechas = models.IntegerField(default=0)
+    mensaje = models.CharField(max_length=300, blank=True, default="")
+    error = models.CharField(max_length=500, blank=True, default="")
+
+    @classmethod
+    def cargar(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)

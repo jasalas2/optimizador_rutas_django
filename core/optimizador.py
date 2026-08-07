@@ -1100,11 +1100,20 @@ def explotar_lineas_simples(gdf_lineas):
     una geometría multi-parte (lanza NotImplementedError), y un shapefile
     real perfectamente puede traer filas MultiLineString (varias calles
     agrupadas en una sola fila de atributos).
+
+    También se fuerza cada geometría a 2D: un shapefile real exportado de un
+    GIS a menudo trae una tercera coordenada (elevación), y el resto del
+    pipeline (haversine, /match de OSRM) asume puntos (lon, lat) -- dejar la
+    Z pasar rompe el "for lon, lat in ..." más adelante.
     """
+    import shapely
+
     simples = []
     for geom in gdf_lineas.geometry:
         if geom is None or geom.is_empty:
             continue
+        if geom.has_z:
+            geom = shapely.force_2d(geom)
         if geom.geom_type == "LineString":
             simples.append(geom)
         elif geom.geom_type == "MultiLineString":
@@ -1165,6 +1174,321 @@ def limpiar_lineas_con_osrm(lineas_geoms, tolerancia_simplificado=0.00008):
         if se_ajusto:
             n_ajustadas += 1
     return lineas_ajustadas, n_ajustadas
+
+
+def distancia_total_camino_m(camino_lonlat):
+    """Suma de distancias entre puntos consecutivos de un camino (lon, lat)."""
+    return sum(
+        _haversine_m_red(camino_lonlat[i], camino_lonlat[i + 1])
+        for i in range(len(camino_lonlat) - 1)
+    )
+
+
+def encadenar_lineas_en_ruta(lineas_geoms, umbral_salto_m=200):
+    """
+    Ordena una lista de líneas (shapely LineString) en UN SOLO recorrido
+    continuo, tipo "conectar los puntos": arranca de la primera línea y va
+    encadenando la más cercana de las que quedan a CUALQUIERA de los dos
+    extremos del recorrido acumulado hasta ahora (el inicio o el final, no
+    solo el final -- si no, la primera línea elegida al azar podría en
+    realidad ir al final de la ruta real, y todo lo demás terminaría mal
+    encadenado), invirtiéndola si hace falta para que conecte, hasta que no
+    queda ninguna suelta.
+
+    Pensado para un shapefile que representa una RUTA REAL ya recorrida por
+    un camión (no una red genérica de calles a cubrir) -- a diferencia de
+    construir_grafo_red, acá no importa la topología completa, solo el
+    orden en que un camión pasaría por cada tramo. Si el archivo ya viene
+    en el orden correcto, esto simplemente los pega uno detrás de otro
+    (saltos ~0m); si no, reconstruye el orden más razonable por cercanía.
+
+    umbral_salto_m: distancia a partir de la cual una unión entre dos
+    líneas se considera un "salto" (probable hueco/tramo suelto en el
+    archivo original) en vez de una continuación natural -- se reporta,
+    no se descarta nada.
+
+    Devuelve (camino, saltos):
+      - camino: lista de (lon, lat) de la ruta completa encadenada.
+      - saltos: lista de {"pieza": número de tramo encadenado (orden en que
+        se fue agregando, no posición final), "distancia_m": N} para cada
+        unión que quedó por encima de `umbral_salto_m`.
+    """
+    if not lineas_geoms:
+        return [], []
+
+    restantes = [list(g.coords) for g in lineas_geoms]
+    camino = list(restantes.pop(0))
+    saltos = []
+    pieza_n = 1
+
+    while restantes:
+        inicio_actual, fin_actual = camino[0], camino[-1]
+        # candidatos: (distancia, "fin"|"inicio", invertir_la_pieza)
+        mejor = None
+        for i, coords in enumerate(restantes):
+            candidatos = (
+                (_haversine_m_red(fin_actual, coords[0]), "fin", False),
+                (_haversine_m_red(fin_actual, coords[-1]), "fin", True),
+                (_haversine_m_red(inicio_actual, coords[-1]), "inicio", False),
+                (_haversine_m_red(inicio_actual, coords[0]), "inicio", True),
+            )
+            for dist, extremo, invertir in candidatos:
+                if mejor is None or dist < mejor[0]:
+                    mejor = (dist, i, extremo, invertir)
+
+        dist, i, extremo, invertir = mejor
+        coords_elegidas = restantes.pop(i)
+        pieza = coords_elegidas[::-1] if invertir else coords_elegidas
+        if dist > umbral_salto_m:
+            saltos.append({"pieza": pieza_n, "distancia_m": round(dist)})
+        if extremo == "fin":
+            camino.extend(pieza)
+        else:
+            camino = pieza + camino
+        pieza_n += 1
+
+    return camino, saltos
+
+
+def encadenar_en_subrutas(lineas_geoms, umbral_split_m=800, umbral_salto_m=200):
+    """
+    Igual que encadenar_lineas_en_ruta, pero en vez de forzar TODOS los
+    tramos sueltos en un único recorrido, corta y arranca una ruta nueva
+    cada vez que la conexión más cercana disponible supera `umbral_split_m`.
+
+    Motivo: un shapefile municipal real suele traer VARIAS rutas distintas
+    (zonas, días, camiones diferentes) como tramos sueltos, sin ninguna
+    marca de a cuál pertenece cada uno -- si algo así se encadena a la
+    fuerza en un solo recorrido, el "puente" artificial entre dos rutas que
+    no tienen nada que ver se ve como una línea recta larga cruzando zonas
+    sin calles, o como si el camión diera vueltas sin sentido. Cortar ahí y
+    tratarlas como rutas separadas es más fiel a la realidad.
+
+    Devuelve una lista de {"camino": [...], "saltos": [...]}, una por cada
+    grupo de tramos que quedó conectado entre sí (mismo formato de salida
+    que encadenar_lineas_en_ruta para cada uno).
+    """
+    if not lineas_geoms:
+        return []
+
+    restantes = [list(g.coords) for g in lineas_geoms]
+    rutas = []
+
+    while restantes:
+        camino = list(restantes.pop(0))
+        saltos = []
+        pieza_n = 1
+
+        while restantes:
+            inicio_actual, fin_actual = camino[0], camino[-1]
+            mejor = None
+            for i, coords in enumerate(restantes):
+                candidatos = (
+                    (_haversine_m_red(fin_actual, coords[0]), "fin", False),
+                    (_haversine_m_red(fin_actual, coords[-1]), "fin", True),
+                    (_haversine_m_red(inicio_actual, coords[-1]), "inicio", False),
+                    (_haversine_m_red(inicio_actual, coords[0]), "inicio", True),
+                )
+                for dist, extremo, invertir in candidatos:
+                    if mejor is None or dist < mejor[0]:
+                        mejor = (dist, i, extremo, invertir)
+
+            dist, i, extremo, invertir = mejor
+            if dist > umbral_split_m:
+                break  # nada queda razonablemente cerca -- esta ruta termina acá
+
+            coords_elegidas = restantes.pop(i)
+            pieza = coords_elegidas[::-1] if invertir else coords_elegidas
+            if dist > umbral_salto_m:
+                saltos.append({"pieza": pieza_n, "distancia_m": round(dist)})
+            if extremo == "fin":
+                camino.extend(pieza)
+            else:
+                camino = pieza + camino
+            pieza_n += 1
+
+        rutas.append({"camino": camino, "saltos": saltos})
+
+    return rutas
+
+
+def columnas_atributos_lineas(gdf_lineas):
+    """
+    Nombres de columnas de atributos (todas menos la de geometría) y hasta 3
+    valores de ejemplo de cada una -- para ofrecerle al usuario elegir cuál
+    columna de la tabla de atributos identifica a qué ruta/día/zona
+    pertenece cada tramo (mucho más confiable que adivinar por cercanía
+    geográfica cuando el dato ya viene explícito en el archivo).
+    """
+    columnas = [c for c in gdf_lineas.columns if c != gdf_lineas.geometry.name]
+    muestras = {}
+    for c in columnas:
+        valores = gdf_lineas[c].dropna().unique()[:3]
+        muestras[c] = [str(v) for v in valores]
+    return columnas, muestras
+
+
+def explotar_lineas_simples_con_atributo(gdf_lineas, columna=None):
+    """
+    Igual que explotar_lineas_simples, pero además devuelve, junto a cada
+    geometría, el valor de `columna` de su fila original -- para poder
+    agrupar tramos por una columna real de la tabla de atributos (ej.
+    "dia", "ruta", "zona") en vez de solo por cercanía geográfica.
+
+    Si `columna` es None o no existe en el GeoDataFrame, el valor es None
+    para todas las líneas (el que llama debe caer a agrupar por cercanía).
+
+    Devuelve una lista de (geom, valor) -- una entrada por cada LineString
+    simple (una MultiLineString se separa en sus partes, cada parte hereda
+    el valor de atributo de la fila original).
+    """
+    import shapely
+
+    tiene_columna = bool(columna) and columna in gdf_lineas.columns
+    pares = []
+    for _, fila in gdf_lineas.iterrows():
+        geom = fila.geometry
+        if geom is None or geom.is_empty:
+            continue
+        valor = fila[columna] if tiene_columna else None
+        if geom.has_z:
+            geom = shapely.force_2d(geom)
+        if geom.geom_type == "LineString":
+            pares.append((geom, valor))
+        elif geom.geom_type == "MultiLineString":
+            for parte in geom.geoms:
+                pares.append((parte, valor))
+    return pares
+
+
+def encadenar_rutas_reales(pares_geom_valor, umbral_salto_m=200, umbral_split_m=800):
+    """
+    Agrupa y encadena tramos sueltos en una o varias rutas reales.
+
+    - Si vienen con un valor de atributo (el usuario eligió una columna de
+      día/ruta/zona en la tabla de atributos del shapefile), se agrupan
+      ESTRICTAMENTE por ese valor -- es la fuente más confiable, porque
+      viene explícita en el archivo en vez de adivinada.
+    - Si no hay valor de atributo (viene None para todos), se agrupan por
+      cercanía geográfica (ver encadenar_en_subrutas) como aproximación.
+
+    Devuelve una lista de {"camino": [...], "saltos": [...], "etiqueta":
+    str|None} -- etiqueta es el valor de la columna elegida, o None si se
+    agrupó por cercanía.
+    """
+    tiene_atributo = any(valor is not None for _, valor in pares_geom_valor)
+
+    if not tiene_atributo:
+        grupos = encadenar_en_subrutas(
+            [geom for geom, _ in pares_geom_valor], umbral_split_m, umbral_salto_m
+        )
+        for g in grupos:
+            g["etiqueta"] = None
+        return grupos
+
+    geoms_por_valor = {}
+    orden_valores = []
+    for geom, valor in pares_geom_valor:
+        clave = str(valor)
+        if clave not in geoms_por_valor:
+            geoms_por_valor[clave] = []
+            orden_valores.append(clave)
+        geoms_por_valor[clave].append(geom)
+
+    rutas = []
+    for clave in orden_valores:
+        camino, saltos = encadenar_lineas_en_ruta(geoms_por_valor[clave], umbral_salto_m)
+        rutas.append({"camino": camino, "saltos": saltos, "etiqueta": clave})
+    return rutas
+
+
+def limpiar_ruta_con_osrm(camino, tolerancia_simplificado=0.00008, tamano_tramo=9):
+    """
+    Ajusta un recorrido YA ORDENADO (ver encadenar_lineas_en_ruta) a calles
+    reales de OSM -- simplifica primero (Douglas-Peucker) para no exceder el
+    límite de puntos por consulta de OSRM, y ajusta en tandas de a
+    `tamano_tramo` puntos, EN PARALELO.
+
+    A diferencia de limpiar_lineas_con_osrm (que trata cada línea completa
+    como una unidad, todo o nada), acá el fallback es POR TANDA: una ruta
+    real larga (cientos/miles de puntos) puede tener un solo tramo puntual
+    que no matchea -- por ejemplo, uno de los "saltos" que arma
+    encadenar_lineas_en_ruta cuando el archivo original tenía un hueco, que
+    es una línea recta y no corresponde a ninguna calle real. Si el ajuste
+    fuera todo-o-nada, ESE único tramo problemático tiraría abajo el ajuste
+    de la ruta COMPLETA. Acá, si una tanda no matchea, esa tanda puntual
+    queda con su geometría cruda (sin simplificar) y se sigue con el resto.
+
+    Devuelve (camino_ajustado, n_tramos_ajustados, n_tramos_total).
+    """
+    if len(camino) < 2:
+        return camino, 0, 0
+
+    from shapely.geometry import LineString
+    simplificado = list(LineString(camino).simplify(tolerancia_simplificado).coords)
+    if len(simplificado) < 2:
+        simplificado = camino
+
+    tramos = []
+    i = 0
+    while i < len(simplificado) - 1:
+        fin = min(i + tamano_tramo, len(simplificado) - 1)
+        tramos.append(simplificado[i:fin + 1])
+        if fin == len(simplificado) - 1:
+            break
+        i = fin
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        ajustes = list(pool.map(_osrm_match_tanda, tramos))
+
+    camino_final = []
+    n_ajustados = 0
+    for tramo_original, tramo_ajustado in zip(tramos, ajustes):
+        pieza = tramo_ajustado if tramo_ajustado else tramo_original
+        if tramo_ajustado:
+            n_ajustados += 1
+        if camino_final:
+            camino_final.extend(pieza[1:])  # el primer punto repite el último de la tanda anterior
+        else:
+            camino_final.extend(pieza)
+
+    return camino_final, n_ajustados, len(tramos)
+
+
+def exportar_gpx_camino(camino_lonlat, nombre="Ruta"):
+    """GPX de un solo track (sin waypoints/paradas) a partir de un camino
+    (lon, lat) -- pensado para exportar el resultado de Ruta real o de Red
+    propia, que no tienen "paradas" como el modelo principal, solo un
+    trazado. Ver exportar_gpx para el caso con paradas."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+    from xml.dom import minidom
+    gpx = Element("gpx", {"version": "1.1", "creator": "Optimizador de Rutas",
+                          "xmlns": "http://www.topografix.com/GPX/1/1"})
+    trk = SubElement(gpx, "trk")
+    SubElement(trk, "name").text = nombre
+    trkseg = SubElement(trk, "trkseg")
+    for lon, lat in camino_lonlat:
+        SubElement(trkseg, "trkpt", {"lat": str(lat), "lon": str(lon)})
+    raw = tostring(gpx, encoding="unicode")
+    return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
+
+
+def exportar_kml_camino(camino_lonlat, nombre="Ruta"):
+    """KML de una sola línea a partir de un camino (lon, lat) -- ver
+    exportar_gpx_camino."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+    from xml.dom import minidom
+    kml = Element("kml", {"xmlns": "http://www.opengis.net/kml/2.2"})
+    doc = SubElement(kml, "Document")
+    SubElement(doc, "name").text = nombre
+    pm = SubElement(doc, "Placemark")
+    SubElement(pm, "name").text = nombre
+    ls = SubElement(pm, "LineString")
+    SubElement(ls, "tessellate").text = "1"
+    coords = SubElement(ls, "coordinates")
+    coords.text = " ".join(f"{lon},{lat},0" for lon, lat in camino_lonlat)
+    raw = tostring(kml, encoding="unicode")
+    return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
 
 
 def enganchar_a_red(punto_lonlat, nodos):
@@ -1231,6 +1555,215 @@ def descargar_red_osm_clasificada(bbox, network_type="drive"):
     gdf_edges = gdf_edges.reset_index()
     gdf_edges["highway"] = gdf_edges["highway"].apply(_normalizar_highway)
     return gdf_edges[["highway", "geometry"]]
+
+
+# El servidor público principal de Overpass (overpass-api.de) es gratuito y
+# compartido -- bajo carga puede tardar minutos en aceptar la conexión o
+# directamente no responder. Estos espejos públicos alternativos sirven la
+# misma base de datos; si el primero está saturado, se prueba el siguiente
+# en vez de dejar al usuario esperando 3 minutos por uno solo.
+_ESPEJOS_OVERPASS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.openstreetmap.ru/api",
+]
+
+
+def _descargar_grafo_osm_con_reintentos(func_descarga):
+    """
+    Corre `func_descarga()` (una llamada a osmnx que arma el grafo, ej.
+    `lambda: ox.graph_from_bbox(...)`) probando varios espejos públicos de
+    Overpass (ver _ESPEJOS_OVERPASS) con un timeout más corto que el de por
+    defecto -- el servidor público principal a veces está saturado y tarda
+    minutos en aceptar la conexión o directamente no responde; así una
+    consulta colgada en un espejo no bloquea antes de intentar el
+    siguiente. Devuelve el grafo (networkx) del primer espejo que responda.
+    """
+    import osmnx as ox
+
+    timeout_original = ox.settings.requests_timeout
+    url_original = ox.settings.overpass_url
+    ultimo_error = None
+    try:
+        ox.settings.requests_timeout = 60
+        for url_espejo in _ESPEJOS_OVERPASS:
+            ox.settings.overpass_url = url_espejo
+            try:
+                return func_descarga()
+            except Exception as e:
+                ultimo_error = e
+                continue
+        raise ConnectionError(
+            f"No se pudo conectar a ningún servidor de OpenStreetMap/Overpass "
+            f"(se probaron {len(_ESPEJOS_OVERPASS)}): {ultimo_error}"
+        )
+    finally:
+        ox.settings.requests_timeout = timeout_original
+        ox.settings.overpass_url = url_original
+
+
+def descargar_red_osm_en_poligono(poligono, network_type="drive"):
+    """
+    Descarga la red vial real de OSM (vía Overpass) recortada EXACTAMENTE
+    al polígono dado -- pensado para cuando lo que sube el usuario no es un
+    trazado de calles sino el polígono de una zona/sector de recolección:
+    en vez de pedirle una ruta ya digitalizada, se usa el polígono como
+    límite y se trae la calle real de OSM que cae adentro, para después
+    calcular la cobertura total (Cartero Chino, igual que con una red
+    subida a mano) sobre esas calles reales.
+
+    Un polígono digitalizado a mano (real, de una municipalidad) a veces
+    viene con auto-intersecciones u otros problemas de validez -- osmnx
+    recorta el grafo descargado al polígono exacto, y con un polígono
+    inválido esa parte puede fallar en silencio y devolver un grafo vacío
+    (sin ningún error). Por eso se repara con buffer(0) antes de usarlo si
+    hace falta (truco estándar de shapely para geometrías inválidas).
+
+    poligono: shapely Polygon o MultiPolygon en EPSG:4326.
+    Devuelve un GeoDataFrame de líneas (una fila por calle). Requiere
+    conexión a internet.
+    """
+    import osmnx as ox
+
+    if not poligono.is_valid:
+        poligono = poligono.buffer(0)
+
+    G = _descargar_grafo_osm_con_reintentos(
+        lambda: ox.graph_from_polygon(poligono, network_type=network_type, simplify=True)
+    )
+    gdf_edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    return gdf_edges.reset_index()[["geometry"]]
+
+
+# Caché en memoria (por proceso) de descargas de calles de OSM por bbox,
+# para Red propia con polígono -- mismo patrón que _CACHE_RED_OSM (usado
+# para la clasificación por tipo de vía), tabla aparte porque acá no se
+# clasifica nada, solo se guarda la geometría cruda. Volver a cargar el
+# mismo polígono (o uno que caiga en el mismo bbox redondeado) reusa la
+# descarga en vez de volver a pedirle a Overpass.
+_CACHE_RED_OSM_POLIGONO = {}
+_CACHE_RED_OSM_POLIGONO_TTL_S = 24 * 3600  # 24 horas
+
+
+def _descargar_calles_en_bbox_cacheado(bbox, network_type="drive"):
+    """Descarga las calles de OSM dentro de un bbox, reusando el resultado
+    si ese mismo bbox (redondeado) ya se pidió hace menos de
+    _CACHE_RED_OSM_POLIGONO_TTL_S. Si la descarga falla, no se guarda nada
+    en caché (para reintentar la próxima vez en vez de quedar pegado a un
+    fallo)."""
+    import osmnx as ox
+
+    clave = (_bbox_redondeado(bbox), network_type)
+    ahora = time.time()
+    entrada = _CACHE_RED_OSM_POLIGONO.get(clave)
+    if entrada is not None and (ahora - entrada[0]) < _CACHE_RED_OSM_POLIGONO_TTL_S:
+        return entrada[1]
+
+    G = _descargar_grafo_osm_con_reintentos(
+        lambda: ox.graph_from_bbox(bbox, network_type=network_type, simplify=True)
+    )
+    gdf_calles = ox.graph_to_gdfs(G, nodes=False, edges=True).reset_index()[["geometry"]]
+    _CACHE_RED_OSM_POLIGONO[clave] = (ahora, gdf_calles)
+    return gdf_calles
+
+
+def descargar_red_osm_por_zonas(grupos, network_type="drive"):
+    """
+    Descarga las calles reales de OSM para VARIAS zonas a la vez con UNA
+    SOLA consulta a Overpass (sobre el bbox que envuelve todos los
+    polígonos), y después reparte cada calle a la zona con la que se
+    superpone -- en vez de una consulta separada por zona.
+
+    Importa sobre todo cuando hay muchas zonas (ej. un archivo con 70+
+    sectores): 70 consultas secuenciales a un servidor público compartido
+    tardan un montón (y son mal vistas por su política de uso), mientras
+    que descargar el área total de una sola vez y repartir localmente
+    (rápido, sin red) es muchísimo más rápido y respeta mejor el servicio.
+
+    Se descarga por BBOX (no recortado al polígono exacto de la unión) a
+    propósito: la unión de muchos polígonos reales (auto-intersecciones,
+    formas irregulares) puede quedar inválida para osmnx, que la usa para
+    recortar el grafo y en ese caso puede devolver un grafo vacío en
+    silencio. Pedir el bbox siempre funciona -- de sobra trae algunas
+    calles fuera de todas las zonas, pero esas simplemente no se asignan a
+    ninguna zona en el reparto de abajo y se descartan ahí.
+
+    La descarga del bbox queda cacheada 24h (ver
+    _descargar_calles_en_bbox_cacheado) -- volver a cargar el mismo
+    polígono (o uno que caiga en el mismo bbox), aunque sea con otra
+    columna de agrupación, reusa las calles ya bajadas en vez de volver a
+    consultar Overpass.
+
+    grupos: lista de (etiqueta, poligono) -- ver agrupar_poligonos_por_atributo.
+    Devuelve una lista de (etiqueta, gdf_calles) en el mismo orden que
+    `grupos`; gdf_calles puede quedar vacío si ninguna calle de OSM cayó
+    dentro de esa zona en particular.
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    poligono_total = unary_union([p for _, p in grupos])
+    bbox = poligono_total.bounds
+    gdf_calles = _descargar_calles_en_bbox_cacheado(bbox, network_type=network_type)
+
+    if len(gdf_calles) == 0:
+        raise ValueError("OpenStreetMap no devolvió ninguna calle dentro del área del polígono.")
+
+    zonas_geoms = [p if p.is_valid else p.buffer(0) for _, p in grupos]
+    gdf_zonas = gpd.GeoDataFrame(
+        {"etiqueta": [etq for etq, _ in grupos]},
+        geometry=zonas_geoms,
+        crs="EPSG:4326",
+    )
+
+    puntos_medios = gdf_calles.geometry.apply(lambda g: g.interpolate(0.5, normalized=True))
+    gdf_puntos_medios = gpd.GeoDataFrame(geometry=puntos_medios, crs="EPSG:4326")
+    # "intersects" (no "within"): una calle justo sobre el borde de una zona
+    # puede no caer estrictamente ADENTRO por errores de precisión mínimos,
+    # y no queremos perderla por eso.
+    asignacion = gpd.sjoin(gdf_puntos_medios, gdf_zonas, how="left", predicate="intersects")
+    # Una calle justo sobre el límite entre dos zonas puede matchear ambas
+    # -- nos quedamos con la primera asignación por calle, no importa cuál.
+    asignacion = asignacion[~asignacion.index.duplicated(keep="first")]
+
+    resultado = []
+    for etiqueta, _ in grupos:
+        indices = asignacion.index[asignacion["etiqueta"] == etiqueta]
+        resultado.append((etiqueta, gdf_calles.loc[indices]))
+    return resultado
+
+
+def agrupar_poligonos_por_atributo(gdf_poligono, columna=None):
+    """
+    Agrupa las filas de un GeoDataFrame de polígonos por el valor de
+    `columna` -- pensado para un shapefile de zonas/sectores de recolección
+    donde cada fila (o grupo de filas) es una zona distinta, identificada
+    por una columna real de la tabla de atributos (ej. "sector", "zona").
+
+    Si `columna` es None o no existe, TODO el archivo se trata como una
+    sola zona (se unen todos los polígonos en una sola geometría) -- mismo
+    comportamiento que antes de poder elegir columna.
+
+    Devuelve una lista de (etiqueta, poligono) -- etiqueta es el valor de
+    la columna (str) o None si es una sola zona; poligono es un Polygon o
+    MultiPolygon de shapely (unión de todas las filas de ese grupo).
+    """
+    from shapely.ops import unary_union
+
+    tiene_columna = bool(columna) and columna in gdf_poligono.columns
+    if not tiene_columna:
+        return [(None, unary_union(list(gdf_poligono.geometry)))]
+
+    grupos = {}
+    orden = []
+    for _, fila in gdf_poligono.iterrows():
+        clave = str(fila[columna])
+        if clave not in grupos:
+            grupos[clave] = []
+            orden.append(clave)
+        grupos[clave].append(fila.geometry)
+
+    return [(clave, unary_union(grupos[clave])) for clave in orden]
 
 
 # Caché en memoria (por proceso) de la red vial ya clasificada, para no
@@ -1549,10 +2082,34 @@ def calcular_recorrido_cobertura_total(G, nodo_inicio):
     }
 
 
+def _reproyectar_a_wgs84(gdf):
+    """Reproyecta un GeoDataFrame a EPSG:4326 (lon/lat).
+
+    Un shapefile municipal real a veces no trae el .prj (o Windows lo separa
+    al comprimir a mano) -- geopandas lo lee entonces sin CRS (gdf.crs is
+    None), y sin más info se asumiría que las coordenadas YA son lon/lat,
+    lo que rompe todo si en realidad vienen en un sistema proyectado (metros)
+    como CRTM05 (EPSG:5367 -- el oficial de Costa Rica, el más probable acá).
+    Para no confundir "no hay CRS" con "ya está en WGS84", se revisan los
+    valores: si están muy fuera del rango válido de lon/lat (-180..180,
+    -90..90), es casi seguro un CRS proyectado -- se asume CRTM05 y se
+    reproyecta desde ahí. Si están dentro de rango, se asume que ya es
+    WGS84 (comportamiento anterior)."""
+    if gdf.crs is not None:
+        if str(gdf.crs) != "EPSG:4326":
+            gdf = gdf.to_crs("EPSG:4326")
+        return gdf
+
+    minx, miny, maxx, maxy = gdf.total_bounds
+    fuera_de_rango = minx < -180 or maxx > 180 or miny < -90 or maxy > 90
+    if fuera_de_rango:
+        gdf = gdf.set_crs("EPSG:5367").to_crs("EPSG:4326")
+    return gdf
+
+
 def _normalizar_gdf_lineas(gdf):
     """Reproyecta a EPSG:4326 y filtra solo geometrías de línea."""
-    if gdf.crs is not None and str(gdf.crs) != "EPSG:4326":
-        gdf = gdf.to_crs("EPSG:4326")
+    gdf = _reproyectar_a_wgs84(gdf)
     tipos_validos = {"LineString", "MultiLineString"}
     gdf = gdf[gdf.geometry.geom_type.isin(tipos_validos)]
     if len(gdf) == 0:
@@ -1561,10 +2118,21 @@ def _normalizar_gdf_lineas(gdf):
     return gdf, None
 
 
-def leer_capa_lineas(archivos_subidos):
+def _normalizar_gdf_poligonos(gdf):
+    """Reproyecta a EPSG:4326 y filtra solo geometrías de polígono."""
+    gdf = _reproyectar_a_wgs84(gdf)
+    tipos_validos = {"Polygon", "MultiPolygon"}
+    gdf = gdf[gdf.geometry.geom_type.isin(tipos_validos)]
+    if len(gdf) == 0:
+        return None, ("El archivo no contiene geometrías de polígono "
+                      "(¿es una capa de puntos o líneas?).")
+    return gdf, None
+
+
+def _leer_gdf_crudo(archivos_subidos):
     """
-    Lee una capa de líneas desde archivos subidos, en cualquiera de estos
-    formatos:
+    Lee un GeoDataFrame crudo (sin normalizar CRS ni filtrar tipo de
+    geometría) desde archivos subidos, en cualquiera de estos formatos:
       A) Un .zip conteniendo el shapefile (aunque los archivos estén dentro
          de una subcarpeta, como pasa al comprimir con clic derecho en Windows)
       B) Un .geojson / .json
@@ -1572,7 +2140,12 @@ def leer_capa_lineas(archivos_subidos):
       D) Los archivos del shapefile SUELTOS sin comprimir: .shp + .shx + .dbf
          (y .prj si existe), subidos juntos en la misma carga
 
-    Devuelve (GeoDataFrame en EPSG:4326, None) o (None, mensaje_error).
+    Compartido por leer_capa_lineas y leer_capa_poligono -- la parte de
+    detectar el formato y leerlo es idéntica, solo cambia qué tipo de
+    geometría se espera al final (ver _normalizar_gdf_lineas /
+    _normalizar_gdf_poligonos).
+
+    Devuelve (GeoDataFrame crudo, None) o (None, mensaje_error).
     """
     import zipfile
     import tempfile
@@ -1588,10 +2161,9 @@ def leer_capa_lineas(archivos_subidos):
     for archivo, nombre in zip(archivos_subidos, nombres):
         if nombre.endswith((".geojson", ".json")):
             try:
-                gdf = gpd.read_file(archivo)
+                return gpd.read_file(archivo), None
             except Exception as e:
                 return None, f"No se pudo leer el GeoJSON: {e}"
-            return _normalizar_gdf_lineas(gdf)
 
     # ── C) GeoPackage directo ──
     for archivo, nombre in zip(archivos_subidos, nombres):
@@ -1601,10 +2173,9 @@ def leer_capa_lineas(archivos_subidos):
                 with open(ruta, "wb") as f:
                     f.write(archivo.getbuffer())
                 try:
-                    gdf = gpd.read_file(ruta)
+                    return gpd.read_file(ruta), None
                 except Exception as e:
                     return None, f"No se pudo leer el GeoPackage: {e}"
-            return _normalizar_gdf_lineas(gdf)
 
     # ── A) Zip con shapefile (búsqueda RECURSIVA del .shp, tolera subcarpetas) ──
     for archivo, nombre in zip(archivos_subidos, nombres):
@@ -1628,10 +2199,9 @@ def leer_capa_lineas(archivos_subidos):
                     return None, ("No se encontró ningún archivo .shp dentro del .zip "
                                   "(ni en subcarpetas). Verificá el contenido del zip.")
                 try:
-                    gdf = gpd.read_file(shp_path)
+                    return gpd.read_file(shp_path), None
                 except Exception as e:
                     return None, f"No se pudo leer el shapefile: {e}"
-            return _normalizar_gdf_lineas(gdf)
 
     # ── D) Archivos del shapefile sueltos (.shp + .shx + .dbf juntos) ──
     if any(n.endswith(".shp") for n in nombres):
@@ -1650,10 +2220,30 @@ def leer_capa_lineas(archivos_subidos):
                 if nombre.endswith(".shp"):
                     base = ruta
             try:
-                gdf = gpd.read_file(base)
+                return gpd.read_file(base), None
             except Exception as e:
                 return None, f"No se pudo leer el shapefile: {e}"
-        return _normalizar_gdf_lineas(gdf)
 
     return None, ("Formato no reconocido. Subí un .zip con el shapefile, un "
                   ".geojson, un .gpkg, o los archivos .shp + .shx + .dbf juntos.")
+
+
+def leer_capa_lineas(archivos_subidos):
+    """Lee una capa de líneas desde archivos subidos (ver _leer_gdf_crudo
+    para los formatos aceptados). Devuelve (GeoDataFrame en EPSG:4326,
+    None) o (None, mensaje_error)."""
+    gdf, error = _leer_gdf_crudo(archivos_subidos)
+    if error:
+        return None, error
+    return _normalizar_gdf_lineas(gdf)
+
+
+def leer_capa_poligono(archivos_subidos):
+    """Lee una capa de polígonos desde archivos subidos (ver
+    _leer_gdf_crudo para los formatos aceptados) -- pensado para un
+    polígono de zona/sector de recolección, no un trazado de calles.
+    Devuelve (GeoDataFrame en EPSG:4326, None) o (None, mensaje_error)."""
+    gdf, error = _leer_gdf_crudo(archivos_subidos)
+    if error:
+        return None, error
+    return _normalizar_gdf_poligonos(gdf)

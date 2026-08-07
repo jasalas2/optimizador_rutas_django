@@ -11,38 +11,47 @@ import pandas as pd
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.http import Http404, HttpResponse, JsonResponse
-from django.shortcuts import redirect, render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.text import slugify
 from django.views.decorators.http import require_POST
-from shapely.geometry import LineString
 
 from core.optimizador import (
     DIAS_SEMANA,
     TIPOS_VIA_DEFAULT,
-    ajustar_una_linea_con_osrm,
+    agrupar_poligonos_por_atributo,
     bbox_de_camino,
     calcular_recorrido_cobertura_total,
     calcular_rutas_para_puntos,
     clasificar_tramos_ruta,
+    columnas_atributos_lineas,
     construir_grafo_red,
     construir_indice_vias,
     contar_componentes_red,
     costo_diario_inversion,
     costo_diario_recurrente,
     descargar_red_osm_clasificada,
+    descargar_red_osm_por_zonas,
     dias_desde_ultima_recoleccion,
+    distancia_total_camino_m,
+    encadenar_rutas_reales,
     enganchar_a_red,
     explotar_lineas_simples,
+    explotar_lineas_simples_con_atributo,
     exportar_geojson,
     exportar_gpx,
+    exportar_gpx_camino,
     exportar_kml,
+    exportar_kml_camino,
     exportar_shapefile,
     filtrar_camiones_para_grupo,
     generar_links_google_maps,
     geocodificar_direccion,
     leer_capa_lineas,
+    leer_capa_poligono,
     limpiar_lineas_con_osrm,
+    limpiar_ruta_con_osrm,
     obtener_ruta_completa_osrm_por_leg,
     peso_estimado_ruta_para_dia,
     reconstruir_viajes_desde_resumen,
@@ -59,9 +68,10 @@ from .models import (
     RedPropiaCargaProgreso,
     RedPropiaGrafo,
     RedPropiaPunto,
-    RedPropiaResultado,
     ResultadoCalculo,
     RutaFrecuencia,
+    RutaRealCarga,
+    RutaRealProgreso,
     TasaViaKgKm,
     ViaResultado,
 )
@@ -1405,18 +1415,21 @@ class _ArchivoDjango(io.BytesIO):
         self.name = uploaded_file.name
 
 
-def _grafo_desde_bd():
-    """Reconstruye el networkx.Graph guardado en RedPropiaGrafo (serializado
-    como nodos + aristas porque un Graph no es JSON-serializable)."""
+def _grafo_desde_bd(zona_idx=0):
+    """Reconstruye el networkx.Graph de UNA zona guardada en RedPropiaGrafo
+    (serializado como nodos + aristas porque un Graph no es
+    JSON-serializable). Devuelve (G, nodos, zona, info) -- G/nodos/zona son
+    None si no hay esa zona cargada."""
     info = RedPropiaGrafo.cargar()
-    if info.nodos_json is None:
-        return None, None, info
+    if not info.zonas_json or zona_idx >= len(info.zonas_json):
+        return None, None, None, info
+    zona = info.zonas_json[zona_idx]
     G = nx.Graph()
-    G.add_nodes_from(range(len(info.nodos_json)))
-    for a, b, peso in info.aristas_json:
+    G.add_nodes_from(range(len(zona["nodos"])))
+    for a, b, peso in zona["aristas"]:
         G.add_edge(a, b, weight=peso)
-    nodos = [tuple(n) for n in info.nodos_json]
-    return G, nodos, info
+    nodos = [tuple(n) for n in zona["nodos"]]
+    return G, nodos, zona, info
 
 
 def _red_propia_punto_to_row(p):
@@ -1424,126 +1437,196 @@ def _red_propia_punto_to_row(p):
 
 
 def red_propia_view(request):
-    G, nodos, info = _grafo_desde_bd()
+    info = RedPropiaGrafo.cargar()
     puntos = RedPropiaPunto.objects.all()
-    resultado = RedPropiaResultado.cargar().resultado_json
     progreso = RedPropiaCargaProgreso.cargar()
 
+    try:
+        zona_idx_inicial = int(request.GET.get("zona", 0))
+    except ValueError:
+        zona_idx_inicial = 0
+    if not info.zonas_json or not (0 <= zona_idx_inicial < len(info.zonas_json)):
+        zona_idx_inicial = 0
+
     context = {
-        "tiene_grafo": G is not None,
+        "tiene_grafo": bool(info.zonas_json),
         "info": info,
         "progreso": progreso,
         "puntos_json": json.dumps([_red_propia_punto_to_row(p) for p in puntos]),
-        "lineas_originales_json": json.dumps(info.lineas_originales_json) if info and info.lineas_originales_json else "null",
-        "resultado": resultado,
-        "resultado_json": json.dumps(resultado) if resultado else "null",
+        "zonas_json": json.dumps(info.zonas_json) if info.zonas_json else "[]",
+        "zona_idx_inicial": zona_idx_inicial,
     }
     return render(request, "rutas/red_propia.html", context)
 
 
-def _cargar_red_en_segundo_plano(lineas_simples, tolerancia_m):
-    """
-    Corre en un hilo aparte (lanzado desde api_red_propia_cargar) -- el
-    ajuste a OSRM de una red real (decenas de líneas, varias consultas cada
-    una) puede tardar minutos, y no tiene sentido dejar al navegador
-    esperando una sola petición HTTP sin ninguna señal de que sigue viva.
-    En vez de eso, esta función va actualizando RedPropiaCargaProgreso línea
-    por línea, y el navegador consulta ese estado (api_red_propia_progreso)
-    para dibujar una barra de progreso real.
-    """
+def _fue_cancelada_o_reemplazada(mi_version):
+    """True si, mientras el hilo de fondo trabajaba, el usuario canceló la
+    carga o arrancó una nueva encima (api_red_propia_cancelar_carga /
+    api_red_propia_cargar_poligono incrementan RedPropiaCargaProgreso.version
+    -- ver el comment en el modelo). No corta una consulta de red ya en
+    vuelo (Python no puede matar un hilo a la fuerza), pero evita que un
+    resultado viejo pise el estado de una carga más nueva, y hace que el
+    hilo deje de trabajar apenas termine el paso actual."""
+    return RedPropiaCargaProgreso.cargar().version != mi_version
+
+
+def _cargar_red_desde_poligono_en_segundo_plano(gdf_poligono, columna_agrupar, mi_version):
+    """Corre en un hilo aparte (lanzado desde api_red_propia_cargar_poligono).
+    Las calles vienen directo de OpenStreetMap -- ya son reales, no hace
+    falta ajustarlas a nada.
+
+    Si el polígono trae varias zonas (agrupadas por la columna de atributo
+    que eligió el usuario, o por cercanía si no hay columna), las calles se
+    descargan con UNA SOLA consulta a Overpass sobre el área total (ver
+    descargar_red_osm_por_zonas) y se reparten localmente después -- pedir
+    una zona a la vez sería muchísimo más lento con un archivo de, por
+    ejemplo, 70 zonas (70 consultas secuenciales a un servidor público
+    compartido).
+
+    tolerancia_m para snappear cruces queda fija en 5m acá adentro (no se le
+    pide al usuario) -- con datos de OSM la topología ya viene limpia (los
+    cruces coinciden exactamente), así que este valor casi nunca importa;
+    exponerlo como campo solo confundía sin aportar nada."""
     from django.db import connection
+    tolerancia_m = 5.0
 
     progreso = RedPropiaCargaProgreso.cargar()
     try:
-        lineas_originales = [list(g.coords) for g in lineas_simples]
-        lineas_ajustadas = []
-        n_ajustadas = 0
-        for i, geom in enumerate(lineas_simples):
-            coords, se_ajusto = ajustar_una_linea_con_osrm(geom)
-            lineas_ajustadas.append(coords)
-            if se_ajusto:
-                n_ajustadas += 1
-            progreso.lineas_hechas = i + 1
-            progreso.mensaje = f"Ajustando líneas a calles reales (OSM)... {i + 1}/{len(lineas_simples)}"
+        grupos = agrupar_poligonos_por_atributo(gdf_poligono, columna_agrupar)
+        n_zonas = len(grupos)
+        progreso.lineas_total = n_zonas
+        progreso.lineas_hechas = 0
+        progreso.mensaje = (
+            f"Descargando las calles reales de OpenStreetMap del área total ({n_zonas} zona(s), "
+            "una sola consulta)... puede tardar varios minutos si el área es grande."
+        )
+        progreso.save()
+
+        grupos_con_calles = descargar_red_osm_por_zonas(grupos)
+
+        if _fue_cancelada_o_reemplazada(mi_version):
+            return
+
+        zonas = []
+        for idx, (etiqueta, gdf_calles) in enumerate(grupos_con_calles, start=1):
+            if _fue_cancelada_o_reemplazada(mi_version):
+                return
+
+            lineas_simples = explotar_lineas_simples(gdf_calles)
+            if not lineas_simples:
+                raise ValueError(
+                    f"OpenStreetMap no devolvió calles dentro de la zona {etiqueta or idx}."
+                )
+
+            progreso.mensaje = (
+                f"Armando la red de la zona {idx} de {n_zonas} ({len(lineas_simples)} calles)..."
+            )
             progreso.save()
 
-        geoms_ajustadas = [LineString(c) if len(c) >= 2 else None for c in lineas_ajustadas]
-        gdf_ajustado = gpd.GeoDataFrame(geometry=geoms_ajustadas)
+            gdf_simples = gpd.GeoDataFrame(geometry=lineas_simples)
+            G, nodos = construir_grafo_red(gdf_simples, tolerancia_m=tolerancia_m)
+            componentes = contar_componentes_red(G)
 
-        G, nodos = construir_grafo_red(gdf_ajustado, tolerancia_m=tolerancia_m)
-        componentes = contar_componentes_red(G)
+            zonas.append({
+                "etiqueta": etiqueta,
+                "nodos": [list(n) for n in nodos],
+                "aristas": [[a, b, d["weight"]] for a, b, d in G.edges(data=True)],
+                "n_lineas": len(lineas_simples),
+                "n_componentes": len(componentes),
+                "tamano_componentes": sorted((len(c) for c in componentes), reverse=True),
+                "resultado": None,
+            })
+            progreso.lineas_hechas = idx
+            progreso.save()
+
+        if _fue_cancelada_o_reemplazada(mi_version):
+            return
 
         info = RedPropiaGrafo.cargar()
-        info.nodos_json = [list(n) for n in nodos]
-        info.aristas_json = [[a, b, d["weight"]] for a, b, d in G.edges(data=True)]
-        info.n_lineas = len(lineas_simples)
-        info.n_componentes = len(componentes)
-        info.tamano_componentes_json = sorted((len(c) for c in componentes), reverse=True)
-        info.lineas_originales_json = [[list(p) for p in linea] for linea in lineas_originales]
-        info.n_lineas_ajustadas = n_ajustadas
+        info.zonas_json = zonas
         info.save()
 
-        resultado_obj = RedPropiaResultado.cargar()
-        resultado_obj.resultado_json = None
-        resultado_obj.save()
-
-        if n_ajustadas < len(lineas_simples):
-            progreso.mensaje = (
-                f"Red cargada. {n_ajustadas} de {len(lineas_simples)} líneas se ajustaron a "
-                "calles reales (OSM); el resto quedó con la geometría original del archivo "
-                "(OSRM no pudo emparejarlas)."
-            )
+        if n_zonas == 1:
+            progreso.mensaje = f"Red cargada desde OpenStreetMap: {zonas[0]['n_lineas']} calles."
         else:
-            progreso.mensaje = "Red cargada y ajustada a calles reales (OSM)."
+            progreso.mensaje = f"Listo. Se cargaron {n_zonas} zonas separadas."
         progreso.error = ""
-    except Exception as e:
-        progreso.error = f"Error cargando la red: {e}"
-    finally:
         progreso.en_progreso = False
         progreso.save()
+    except Exception as e:
+        if _fue_cancelada_o_reemplazada(mi_version):
+            return
+        progreso.error = f"Error descargando la red desde el polígono: {e}"
+        progreso.en_progreso = False
+        progreso.save()
+    finally:
         connection.close()
 
 
 @require_POST
-def api_red_propia_cargar(request):
+def api_red_propia_columnas_poligono(request):
+    """Lee el polígono subido SOLO para devolver sus columnas de atributos
+    (y valores de ejemplo) -- el frontend ofrece elegir cuál columna separa
+    el archivo en varias zonas, antes de procesar nada. Mismo patrón que
+    api_ruta_real_columnas."""
     archivos = request.FILES.getlist("archivos")
-    tolerancia_m = float(request.POST.get("tolerancia_m") or 5.0)
+    if not archivos:
+        return JsonResponse({"error": "No se subió ningún archivo."})
+
+    archivos_adaptados = [_ArchivoDjango(a) for a in archivos]
+    gdf_poligono, error_lectura = leer_capa_poligono(archivos_adaptados)
+    if error_lectura:
+        return JsonResponse({"error": error_lectura})
+
+    columnas, muestras = columnas_atributos_lineas(gdf_poligono)
+    return JsonResponse({"columnas": columnas, "muestras": muestras})
+
+
+@require_POST
+def api_red_propia_cargar_poligono(request):
+    archivos = request.FILES.getlist("archivos")
+    columna_agrupar = request.POST.get("columna_agrupar") or None
     if not archivos:
         messages.error(request, "No se subió ningún archivo.")
         return redirect("rutas:red_propia")
 
     archivos_adaptados = [_ArchivoDjango(a) for a in archivos]
-    gdf_lineas, error_lectura = leer_capa_lineas(archivos_adaptados)
+    gdf_poligono, error_lectura = leer_capa_poligono(archivos_adaptados)
     if error_lectura:
         messages.error(request, error_lectura)
         return redirect("rutas:red_propia")
 
-    # Separa cada MultiLineString del shapefile en líneas simples -- shapely
-    # no deja pedir .coords sobre una geometría multi-parte directamente.
-    lineas_simples = explotar_lineas_simples(gdf_lineas)
-    if not lineas_simples:
-        messages.error(request, "El archivo no tiene líneas válidas.")
-        return redirect("rutas:red_propia")
-
-    # El ajuste a OSRM se hace en un hilo de fondo (ver
-    # _cargar_red_en_segundo_plano) -- acá solo se deja todo listo (archivo
-    # ya leído en memoria, nada que dependa de la petición HTTP en curso) y
-    # se redirige de inmediato; la pantalla muestra una barra de progreso
-    # que consulta el estado sola.
     progreso = RedPropiaCargaProgreso.cargar()
+    progreso.version += 1
     progreso.en_progreso = True
-    progreso.lineas_total = len(lineas_simples)
+    progreso.lineas_total = 0
     progreso.lineas_hechas = 0
-    progreso.mensaje = "Ajustando líneas a calles reales (OSM)..."
+    progreso.mensaje = "Descargando calles reales de OpenStreetMap dentro del polígono..."
     progreso.error = ""
     progreso.save()
 
     hilo = threading.Thread(
-        target=_cargar_red_en_segundo_plano, args=(lineas_simples, tolerancia_m), daemon=True,
+        target=_cargar_red_desde_poligono_en_segundo_plano,
+        args=(gdf_poligono, columna_agrupar, progreso.version), daemon=True,
     )
     hilo.start()
 
     return redirect("rutas:red_propia")
+
+
+@require_POST
+def api_red_propia_cancelar_carga(request):
+    """Cancelación cooperativa: no puede interrumpir una consulta de red ya
+    en vuelo (ver _fue_cancelada_o_reemplazada), pero libera la pantalla al
+    toque -- el hilo de fondo, cuando le toque revisar de nuevo, va a ver
+    que su version quedó vieja y va a cortar sin guardar nada."""
+    progreso = RedPropiaCargaProgreso.cargar()
+    progreso.version += 1
+    progreso.en_progreso = False
+    progreso.mensaje = ""
+    progreso.error = "Cancelado."
+    progreso.save()
+    return JsonResponse({"ok": True})
 
 
 def api_red_propia_progreso(request):
@@ -1581,32 +1664,51 @@ def api_red_propia_guardar_puntos(request):
 
 @require_POST
 def api_red_propia_calcular(request):
-    """Calcula un recorrido que cubre TODA la red cargada (Problema del
-    Cartero Chino / Route Inspection), no la mejor ruta entre puntos
-    elegidos -- ver core.optimizador.calcular_recorrido_cobertura_total.
+    """Calcula un recorrido que cubre TODA la red de la zona seleccionada
+    (Problema del Cartero Chino / Route Inspection), no la mejor ruta entre
+    puntos elegidos -- ver core.optimizador.calcular_recorrido_cobertura_total.
     El primer punto guardado en RedPropiaPunto se usa como inicio/fin del
     circuito (recorrido siempre cerrado)."""
-    G, nodos, info = _grafo_desde_bd()
+    zona_idx = int(request.POST.get("zona_idx") or 0)
+    redirect_zona = f"{reverse('rutas:red_propia')}?zona={zona_idx}"
+    G, nodos, zona, info = _grafo_desde_bd(zona_idx)
     if G is None:
         messages.error(request, "Cargá una red primero.")
         return redirect("rutas:red_propia")
 
-    punto_inicio = RedPropiaPunto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True).first()
-    if punto_inicio is None:
-        messages.error(request, "Necesitás guardar un punto de inicio con coordenadas.")
-        return redirect("rutas:red_propia")
+    if request.POST.get("auto_inicio") == "1":
+        # El recorrido de cobertura total es un circuito cerrado -- siempre
+        # necesita arrancar/terminar en ALGÚN nodo, pero no hace falta que
+        # el usuario elija uno a mano: se toma cualquier nodo del
+        # componente conectado más grande (así el recorrido cubre la mayor
+        # parte posible de la red).
+        componentes = contar_componentes_red(G)
+        if not componentes:
+            messages.error(request, "La red no tiene ningún nodo.")
+            return redirect(redirect_zona)
+        nodo_inicio = next(iter(max(componentes, key=len)))
+        nombre_inicio = "Punto automático"
+        punto_inicio_lonlat = list(nodos[nodo_inicio])
+        dist_enganche_m = 0.0
+    else:
+        punto_inicio = RedPropiaPunto.objects.exclude(latitud__isnull=True).exclude(longitud__isnull=True).first()
+        if punto_inicio is None:
+            messages.error(request, "Necesitás guardar un punto de inicio con coordenadas (o elegir uno automático).")
+            return redirect(redirect_zona)
+        nodo_inicio, dist_enganche_m = enganchar_a_red((punto_inicio.longitud, punto_inicio.latitud), nodos)
+        nombre_inicio = punto_inicio.nombre
+        punto_inicio_lonlat = [punto_inicio.longitud, punto_inicio.latitud]
 
-    nodo_inicio, dist_enganche_m = enganchar_a_red((punto_inicio.longitud, punto_inicio.latitud), nodos)
     resultado_cobertura = calcular_recorrido_cobertura_total(G, nodo_inicio)
     if resultado_cobertura is None:
         messages.error(request, "No se pudo calcular un recorrido con esta red.")
-        return redirect("rutas:red_propia")
+        return redirect(redirect_zona)
 
     camino = [list(nodos[n]) for n in resultado_cobertura["ruta_nodos"]]
 
     resultado = {
-        "nombre_inicio": punto_inicio.nombre,
-        "punto_inicio_lonlat": [punto_inicio.longitud, punto_inicio.latitud],
+        "nombre_inicio": nombre_inicio,
+        "punto_inicio_lonlat": punto_inicio_lonlat,
         "distancia_enganche_km": dist_enganche_m / 1000,
         "camino": camino,
         "distancia_original_km": resultado_cobertura["distancia_original_m"] / 1000,
@@ -1615,12 +1717,202 @@ def api_red_propia_calcular(request):
         "componente_size": resultado_cobertura["componente_size"],
         "nodos_excluidos": resultado_cobertura["nodos_excluidos"],
     }
-    resultado_obj = RedPropiaResultado.cargar()
-    resultado_obj.resultado_json = resultado
-    resultado_obj.save()
+
+    info.zonas_json[zona_idx]["resultado"] = resultado
+    info.save()
 
     messages.success(request, "Recorrido de cobertura total calculado.")
-    return redirect("rutas:red_propia")
+    return redirect(redirect_zona)
+
+
+# ══════════════ Red propia — Ruta real (Beta) ══════════════
+# Independiente de Red propia (cobertura total / Cartero Chino) y del
+# modelo principal. El shapefile subido acá NO es una red genérica de
+# calles a cubrir -- YA ES la ruta real que hace un camión. Solo se
+# encadenan los tramos en un recorrido continuo y se ajustan a calles
+# reales de OSM; no se calcula ninguna cobertura.
+
+def ruta_real_view(request):
+    cargas = list(RutaRealCarga.objects.all())
+    carga_id = request.GET.get("carga")
+    carga_activa = None
+    if carga_id:
+        carga_activa = next((c for c in cargas if str(c.pk) == carga_id), None)
+    if carga_activa is None:
+        carga_activa = cargas[0] if cargas else None
+
+    progreso = RutaRealProgreso.cargar()
+    context = {
+        "tiene_ruta": bool(carga_activa and carga_activa.rutas_json),
+        "cargas": cargas,
+        "carga_activa": carga_activa,
+        "progreso": progreso,
+        "rutas_json": json.dumps(carga_activa.rutas_json) if carga_activa and carga_activa.rutas_json else "[]",
+    }
+    return render(request, "rutas/ruta_real.html", context)
+
+
+def _cargar_ruta_real_en_segundo_plano(pares_geom_valor, nombre):
+    """Corre en un hilo aparte (lanzado desde api_ruta_real_cargar) -- mismo
+    motivo que _cargar_red_desde_poligono_en_segundo_plano: encadenar +
+    ajustar a OSRM puede tardar, y no tiene sentido dejar al navegador
+    esperando una sola petición HTTP sin señal de que sigue viva.
+
+    Un shapefile municipal real puede traer VARIAS rutas distintas (zonas,
+    días, camiones) mezcladas como tramos sueltos -- encadenar_rutas_reales
+    las separa en grupos (por la columna de atributo que eligió el usuario
+    si vino una, si no por cercanía geográfica) en vez de forzar todo en un
+    solo recorrido, y cada grupo se ajusta a OSM por separado."""
+    from django.db import connection
+
+    progreso = RutaRealProgreso.cargar()
+    try:
+        progreso.mensaje = f"Agrupando {len(pares_geom_valor)} tramo(s) en rutas..."
+        progreso.save()
+
+        grupos = encadenar_rutas_reales(pares_geom_valor)
+        n_grupos = len(grupos)
+        progreso.lineas_total = n_grupos
+        progreso.lineas_hechas = 0
+        progreso.save()
+
+        rutas = []
+        for idx, grupo in enumerate(grupos, start=1):
+            progreso.mensaje = f"Ajustando a calles reales (OSM) -- ruta {idx} de {n_grupos}..."
+            progreso.save()
+
+            camino_original = grupo["camino"]
+            camino_ajustado, n_tramos_ajustados, n_tramos_total = limpiar_ruta_con_osrm(camino_original)
+
+            rutas.append({
+                "camino": [list(p) for p in camino_ajustado],
+                "camino_original": [list(p) for p in camino_original],
+                "distancia_km": distancia_total_camino_m(camino_ajustado) / 1000,
+                "n_tramos_ajustados": n_tramos_ajustados,
+                "n_tramos_total": n_tramos_total,
+                "saltos": grupo["saltos"],
+                "etiqueta": grupo.get("etiqueta"),
+            })
+            progreso.lineas_hechas = idx
+            progreso.save()
+
+        rutas.sort(key=lambda r: -r["distancia_km"])
+
+        RutaRealCarga.objects.create(
+            nombre=nombre, n_lineas=len(pares_geom_valor), rutas_json=rutas,
+        )
+
+        if n_grupos == 1:
+            progreso.mensaje = "Ruta cargada."
+        else:
+            origen = "la columna elegida" if rutas[0]["etiqueta"] is not None else "cercanía geográfica"
+            progreso.mensaje = (
+                f"Ruta cargada. Se detectaron {n_grupos} rutas separadas (agrupadas por {origen})."
+            )
+        progreso.error = ""
+    except Exception as e:
+        progreso.error = f"Error cargando la ruta: {e}"
+    finally:
+        progreso.en_progreso = False
+        progreso.save()
+        connection.close()
+
+
+@require_POST
+def api_ruta_real_columnas(request):
+    """Lee el archivo subido SOLO para devolver sus columnas de atributos
+    (y un par de valores de ejemplo de cada una) -- el frontend usa esto
+    para ofrecerle al usuario elegir cuál columna identifica a qué
+    ruta/día/zona pertenece cada tramo, antes de procesar nada."""
+    archivos = request.FILES.getlist("archivos")
+    if not archivos:
+        return JsonResponse({"error": "No se subió ningún archivo."})
+
+    archivos_adaptados = [_ArchivoDjango(a) for a in archivos]
+    gdf_lineas, error_lectura = leer_capa_lineas(archivos_adaptados)
+    if error_lectura:
+        return JsonResponse({"error": error_lectura})
+
+    columnas, muestras = columnas_atributos_lineas(gdf_lineas)
+    return JsonResponse({"columnas": columnas, "muestras": muestras})
+
+
+@require_POST
+def api_ruta_real_cargar(request):
+    archivos = request.FILES.getlist("archivos")
+    if not archivos:
+        messages.error(request, "No se subió ningún archivo.")
+        return redirect("rutas:ruta_real")
+
+    archivos_adaptados = [_ArchivoDjango(a) for a in archivos]
+    gdf_lineas, error_lectura = leer_capa_lineas(archivos_adaptados)
+    if error_lectura:
+        messages.error(request, error_lectura)
+        return redirect("rutas:ruta_real")
+
+    columna_agrupar = request.POST.get("columna_agrupar") or None
+    pares = explotar_lineas_simples_con_atributo(gdf_lineas, columna_agrupar)
+    if not pares:
+        messages.error(request, "El archivo no tiene líneas válidas.")
+        return redirect("rutas:ruta_real")
+
+    nombre = (request.POST.get("nombre") or "").strip()
+    if not nombre:
+        nombre = f"Carga {timezone.now():%d/%m/%Y %H:%M}"
+
+    progreso = RutaRealProgreso.cargar()
+    progreso.en_progreso = True
+    progreso.lineas_total = len(pares)
+    progreso.lineas_hechas = 0
+    progreso.mensaje = "Agrupando tramos..."
+    progreso.error = ""
+    progreso.save()
+
+    hilo = threading.Thread(
+        target=_cargar_ruta_real_en_segundo_plano, args=(pares, nombre), daemon=True,
+    )
+    hilo.start()
+
+    return redirect("rutas:ruta_real")
+
+
+def api_ruta_real_progreso(request):
+    p = RutaRealProgreso.cargar()
+    return JsonResponse({
+        "en_progreso": p.en_progreso,
+        "lineas_total": p.lineas_total,
+        "lineas_hechas": p.lineas_hechas,
+        "mensaje": p.mensaje,
+        "error": p.error,
+    })
+
+
+@require_POST
+def api_ruta_real_eliminar(request, carga_id):
+    RutaRealCarga.objects.filter(pk=carga_id).delete()
+    messages.success(request, "Carga eliminada.")
+    return redirect("rutas:ruta_real")
+
+
+def api_ruta_real_exportar(request, carga_id, ruta_idx, formato):
+    carga = get_object_or_404(RutaRealCarga, pk=carga_id)
+    if ruta_idx < 0 or ruta_idx >= len(carga.rutas_json):
+        raise Http404("Esa ruta no existe en esta carga.")
+
+    ruta = carga.rutas_json[ruta_idx]
+    etiqueta = ruta.get("etiqueta") or f"ruta {ruta_idx + 1}"
+    nombre = f"{carga.nombre} - {etiqueta}"
+    camino = ruta["camino"]
+
+    if formato == "gpx":
+        resp = HttpResponse(exportar_gpx_camino(camino, nombre), content_type="application/gpx+xml")
+        resp["Content-Disposition"] = f'attachment; filename="{slugify(nombre)}.gpx"'
+        return resp
+    if formato == "kml":
+        resp = HttpResponse(exportar_kml_camino(camino, nombre), content_type="application/vnd.google-earth.kml+xml")
+        resp["Content-Disposition"] = f'attachment; filename="{slugify(nombre)}.kml"'
+        return resp
+    raise Http404("Formato no reconocido.")
 
 
 # ══════════════ Recolección en vía (Beta) ══════════════

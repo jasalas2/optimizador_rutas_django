@@ -42,6 +42,7 @@
     <div class="rail-group">
       <div class="eyebrow">Beta</div>
       <a class="rail-link beta {% if request.resolver_match.url_name == 'red_propia' %}activa{% endif %}" href="{% url 'rutas:red_propia' %}"><span class="ic">≈</span> Red propia</a>
+      <a class="rail-link beta {% if request.resolver_match.url_name == 'ruta_real' %}activa{% endif %}" href="{% url 'rutas:ruta_real' %}"><span class="ic">⟿</span> Ruta real</a>
       <a class="rail-link beta {% if request.resolver_match.url_name == 'recoleccion_via' %}activa{% endif %}" href="{% url 'rutas:recoleccion_via' %}"><span class="ic">◇</span> Recol. en vía</a>
     </div>
 
