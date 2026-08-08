@@ -71,6 +71,20 @@
       </div>
 
       <div class="check">
+        <input type="checkbox" id="usar_franjas_trafico" name="usar_franjas_trafico" {% if config.usar_franjas_trafico %}checked{% endif %}>
+        <label for="usar_franjas_trafico">Considerar tráfico típico por hora del día</label>
+      </div>
+      <div class="help">No usa tráfico en vivo (eso requiere un servicio pago) -- se definen a mano franjas
+        horarias de hora pico conocida (ej. mirando el "tráfico típico" de Google Maps para las calles
+        principales de la zona) y la velocidad de los tramos que caen en esa franja se reduce según el
+        multiplicador que definas.</div>
+      <div id="campos-franjas" style="margin-left:1.2rem;border-left:2px solid var(--border);padding-left:1rem;" {% if not config.usar_franjas_trafico %}hidden{% endif %}>
+        <div id="filas-franjas"></div>
+        <button type="button" class="btn" id="btn-agregar-franja" style="margin-top:0.5rem;">+ Agregar franja horaria</button>
+        <input type="hidden" id="franjas_trafico_json" name="franjas_trafico_json">
+      </div>
+
+      <div class="check">
         <input type="checkbox" id="balancear" name="balancear" {% if config.balancear %}checked{% endif %}>
         <label for="balancear">Balancear rutas entre camiones</label>
       </div>
@@ -133,6 +147,51 @@ document.getElementById("usar_almuerzo").addEventListener("change", (e) => {
 });
 document.getElementById("velocidad_variable_via").addEventListener("change", (e) => {
   document.getElementById("campos-via").hidden = !e.target.checked;
+});
+document.getElementById("usar_franjas_trafico").addEventListener("change", (e) => {
+  document.getElementById("campos-franjas").hidden = !e.target.checked;
+});
+
+// ── Franjas horarias de tráfico: filas simples (sin Tabulator, es una
+// lista chica de config) -- se arman a mano en el DOM y se serializan a
+// JSON en un input oculto justo antes de enviar el formulario.
+const FRANJAS_INICIALES = {{ config.franjas_trafico|default:"[]"|safe }};
+const contFranjas = document.getElementById("filas-franjas");
+
+function agregarFilaFranja(franja) {
+  franja = franja || {inicio: "07:00", fin: "09:00", multiplicador: 0.6};
+  const fila = document.createElement("div");
+  fila.className = "fila-2";
+  fila.style.cssText = "grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; align-items: end; margin-bottom: 8px;";
+  fila.innerHTML = `
+    <div>
+      <label>Desde</label>
+      <input type="text" class="franja-inicio" value="${franja.inicio}" placeholder="07:00">
+    </div>
+    <div>
+      <label>Hasta</label>
+      <input type="text" class="franja-fin" value="${franja.fin}" placeholder="09:00">
+    </div>
+    <div>
+      <label>Multiplicador</label>
+      <input type="number" class="franja-mult" value="${franja.multiplicador}" min="0.1" max="1" step="0.05">
+    </div>
+    <button type="button" class="btn-del-fila franja-borrar" title="Eliminar franja">✕</button>
+  `;
+  fila.querySelector(".franja-borrar").addEventListener("click", () => fila.remove());
+  contFranjas.appendChild(fila);
+}
+
+(FRANJAS_INICIALES.length ? FRANJAS_INICIALES : []).forEach(agregarFilaFranja);
+document.getElementById("btn-agregar-franja").addEventListener("click", () => agregarFilaFranja());
+
+document.querySelector("form").addEventListener("submit", () => {
+  const franjas = Array.from(contFranjas.querySelectorAll(".fila-2")).map(fila => ({
+    inicio: fila.querySelector(".franja-inicio").value,
+    fin: fila.querySelector(".franja-fin").value,
+    multiplicador: parseFloat(fila.querySelector(".franja-mult").value),
+  }));
+  document.getElementById("franjas_trafico_json").value = JSON.stringify(franjas);
 });
 </script>
 {% endblock %}

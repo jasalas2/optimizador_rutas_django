@@ -24,6 +24,15 @@ class ConfiguracionGeneral(models.Model):
     velocidad_variable_via = models.BooleanField(default=False)
     velocidad_rapida_kmh = models.PositiveIntegerField(default=40, validators=[MinValueValidator(10), MaxValueValidator(150)])
 
+    usar_franjas_trafico = models.BooleanField(default=False)
+    franjas_trafico = models.JSONField(
+        default=list, blank=True,
+        help_text="Franjas horarias de tráfico típico (ej. hora pico), configuradas a mano en vez "
+                   "de depender de un servicio de tráfico en vivo (que suele ser pago). Lista de "
+                   "{'inicio': 'HH:MM', 'fin': 'HH:MM', 'multiplicador': float}; multiplicador < 1 "
+                   "representa más lento (tráfico).",
+    )
+
     balancear = models.BooleanField(default=False)
 
     peso_minimo_viaje_extra_kg = models.PositiveIntegerField(

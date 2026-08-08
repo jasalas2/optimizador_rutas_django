@@ -54,6 +54,7 @@ from core.optimizador import (
     limpiar_ruta_con_osrm,
     obtener_ruta_completa_osrm_por_leg,
     peso_estimado_ruta_para_dia,
+    recalcular_camion_manual,
     reconstruir_viajes_desde_resumen,
     resolver_vrp,
 )
@@ -380,6 +381,39 @@ def _parsear_num(valor, default, tipo=float):
         return default
 
 
+def _parsear_franjas_trafico(valor_json, warnings):
+    """Valida y normaliza las franjas horarias de tráfico enviadas desde el
+    formulario (JSON armado en el navegador, ver configuracion.html) --
+    cualquier franja con formato de hora inválido o multiplicador fuera de
+    rango se descarta con una advertencia, en vez de bloquear el guardado
+    de toda la configuración por un solo campo mal tipeado."""
+    try:
+        franjas_crudas = json.loads(valor_json or "[]")
+    except (TypeError, ValueError):
+        warnings.append("Franjas de tráfico: no se pudieron leer, se guardó la lista vacía.")
+        return []
+
+    franjas_validas = []
+    for i, franja in enumerate(franjas_crudas, start=1):
+        try:
+            inicio = dt.strptime(franja["inicio"], "%H:%M").time()
+            fin = dt.strptime(franja["fin"], "%H:%M").time()
+            mult = float(franja["multiplicador"])
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"Franja de tráfico #{i}: formato de hora inválido, se descartó.")
+            continue
+        if fin <= inicio:
+            warnings.append(f"Franja de tráfico #{i}: el fin debe ser después del inicio, se descartó.")
+            continue
+        if not (0.1 <= mult <= 1.0):
+            warnings.append(f"Franja de tráfico #{i}: el multiplicador debe estar entre 0.1 y 1.0, se descartó.")
+            continue
+        franjas_validas.append({
+            "inicio": inicio.strftime("%H:%M"), "fin": fin.strftime("%H:%M"), "multiplicador": mult,
+        })
+    return franjas_validas
+
+
 def configuracion_view(request):
     config = ConfiguracionGeneral.cargar()
 
@@ -411,6 +445,11 @@ def configuracion_view(request):
         config.velocidad_variable_via = request.POST.get("velocidad_variable_via") == "on"
         if config.velocidad_variable_via:
             config.velocidad_rapida_kmh = _parsear_num(request.POST.get("velocidad_rapida_kmh"), config.velocidad_rapida_kmh, int)
+
+        config.usar_franjas_trafico = request.POST.get("usar_franjas_trafico") == "on"
+        if config.usar_franjas_trafico:
+            config.franjas_trafico = _parsear_franjas_trafico(
+                request.POST.get("franjas_trafico_json"), warnings)
 
         config.balancear = request.POST.get("balancear") == "on"
 
@@ -624,6 +663,80 @@ def resultados_view(request):
     return render(request, "rutas/resultados.html", context)
 
 
+@require_POST
+def api_recalcular_camion_manual(request):
+    """Recalcula UN camión a partir de un orden de paradas editado a mano
+    (arrastrar y soltar en la Línea de tiempo de Resultados) -- no toca la
+    base de datos, solo devuelve el resultado recalculado para que el
+    navegador lo muestre como vista previa. Para guardarlo de verdad, ver
+    api_guardar_ajuste_manual."""
+    try:
+        body = json.loads(request.body)
+        nombre_camion = body["nombre_camion"]
+        viajes = body["viajes"]
+    except (KeyError, TypeError, ValueError):
+        return JsonResponse({"errores": ["Datos inválidos."]}, status=400)
+
+    if not viajes or not any(viajes):
+        return JsonResponse({"errores": ["El camión necesita al menos 1 parada."]}, status=400)
+
+    # Si el cálculo se hizo por zona/cantón, "nombre" en el resultado viene
+    # con el prefijo de la zona (ej. "Heredia — Camión 3") y el nombre real
+    # del camión en la base de datos queda aparte en "camion_real" -- ver
+    # dónde se arma camiones_combinados en api_ejecutar_calculo.
+    nombre_real = body.get("camion_real") or nombre_camion
+    camion = Camion.objects.filter(nombre=nombre_real).first()
+    if camion is None:
+        return JsonResponse({"errores": [f"No se encontró el camión «{nombre_real}»."]}, status=404)
+    if camion.plantel_lat is None or camion.plantel_lon is None:
+        return JsonResponse({"errores": [f"«{nombre_camion}» no tiene Plantel (Lat/Lon) configurado."]}, status=400)
+
+    config = ConfiguracionGeneral.cargar()
+    try:
+        camion_resultado, errores_osrm = recalcular_camion_manual(
+            nombre_camion=nombre_camion, viajes=viajes,
+            plantel_lonlat=(camion.plantel_lon, camion.plantel_lat),
+            depot_lonlat=(config.depot2_lon, config.depot2_lat),
+            nombre_depot="Planta San Antonio",
+            capacidad_kg=camion.capacidad_kg, personas=camion.personas, viajes_max=camion.viajes_max,
+            hora_inicio=config.hora_inicio, velocidad_kmh=config.velocidad_kmh,
+            tiempo_parada=config.tiempo_parada, tiempo_descarga=config.tiempo_descarga,
+            hora_almuerzo_inicio=config.hora_almuerzo_inicio if config.usar_almuerzo else None,
+            hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
+            tope_horas_jornada=config.tope_horas_jornada,
+            franjas_trafico=config.franjas_trafico if config.usar_franjas_trafico else None,
+        )
+    except Exception as e:
+        return JsonResponse({"errores": [f"No se pudo recalcular: {e}"]}, status=500)
+
+    return JsonResponse({"camion": camion_resultado, "errores_osrm": errores_osrm})
+
+
+@require_POST
+def api_guardar_ajuste_manual(request):
+    """Persiste en ResultadoCalculo los camiones que se editaron a mano en
+    la Línea de tiempo (reemplaza esas entradas por nombre, deja el resto
+    del resultado tal cual)."""
+    try:
+        body = json.loads(request.body)
+        dia = body.get("dia", "")
+        camiones_editados = body["camiones"]
+    except (KeyError, TypeError, ValueError):
+        return JsonResponse({"errores": ["Datos inválidos."]}, status=400)
+
+    resultado_obj = ResultadoCalculo.cargar(dia)
+    resultado = resultado_obj.resultado_json
+    if not resultado:
+        return JsonResponse({"errores": ["No hay un resultado guardado para actualizar."]}, status=404)
+
+    por_nombre = {c["nombre"]: c for c in camiones_editados}
+    resultado["camiones"] = [por_nombre.get(c["nombre"], c) for c in resultado["camiones"]]
+    resultado_obj.resultado_json = resultado
+    resultado_obj.save()
+
+    return JsonResponse({"ok": True})
+
+
 def _reporte_por_ruta(resultado, config):
     """Arma, por cada camión/ruta ya calculada, los indicadores operativos
     del reporte (identificación, distancias por tipo de tramo, y tiempos).
@@ -784,6 +897,7 @@ def _ejecutar_calculo_simulado(camiones_excluidos, camiones_extra, cambio_peso_p
         hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
         tope_horas_jornada=config.tope_horas_jornada,
         peso_minimo_viaje_extra_kg=config.peso_minimo_viaje_extra_kg,
+        franjas_trafico=config.franjas_trafico if config.usar_franjas_trafico else None,
     )
     resultado, error = calcular_rutas_para_puntos(tabla_puntos, tabla_camiones, **kwargs_comunes)
     if error:
@@ -983,6 +1097,7 @@ def api_ejecutar_calculo(request):
         hora_almuerzo_fin=config.hora_almuerzo_fin if config.usar_almuerzo else None,
         tope_horas_jornada=config.tope_horas_jornada,
         peso_minimo_viaje_extra_kg=config.peso_minimo_viaje_extra_kg,
+        franjas_trafico=config.franjas_trafico if config.usar_franjas_trafico else None,
     )
 
     if modo_calculo == "Todos los puntos juntos":

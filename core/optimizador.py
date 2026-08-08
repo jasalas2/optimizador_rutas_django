@@ -10,6 +10,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from datetime import time as datetime_time
 
 import pandas as pd
 import requests
@@ -126,22 +127,54 @@ def geocodificar_direccion(direccion):
         return None, None, f"error inesperado ({e})"
 
 
+def _get_osrm_con_reintentos(url, timeout=30, intentos=3, espera_s=1.5):
+    """
+    Igual que requests.get(url).json(), pero reintenta unas pocas veces si
+    la falla es TRANSITORIA (timeout o error de conexión) antes de darse
+    por vencido -- el servidor público de OSRM (router.project-osrm.org)
+    es compartido y a veces tiene baches momentáneos de saturación; sin
+    esto, un bache de un segundo tira TODA la ruta a línea recta sin
+    necesidad (afecta el cálculo real, no solo cosmético -- la matriz de
+    distancias que usa el optimizador para decidir el orden y la
+    asignación queda degradada).
+
+    Devuelve (data, None) si se obtuvo una respuesta HTTP válida (haya
+    sido "Ok" o un código de error real de OSRM -- un código de error de
+    OSRM no es transitorio, no tiene sentido reintentarlo). Devuelve
+    (None, "timeout" | "conexion") si se agotaron los intentos con fallas
+    transitorias, o (None, excepción) para cualquier otro error inesperado
+    (no se reintenta, no es un caso conocido de falla pasajera).
+    """
+    for intento in range(intentos):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json(), None
+        except requests.exceptions.Timeout:
+            if intento == intentos - 1:
+                return None, "timeout"
+        except requests.exceptions.ConnectionError:
+            if intento == intentos - 1:
+                return None, "conexion"
+        except Exception as e:
+            return None, e
+        time.sleep(espera_s)
+
+
 def obtener_matriz_osrm(locations):
     coords_str = ";".join(f"{lon},{lat}" for lat, lon in locations)
     url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=distance"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == "Ok":
-            return [[int(d) for d in row] for row in data["distances"]], True, None
+    data, err_tipo = _get_osrm_con_reintentos(url)
+    if data is not None and data.get("code") == "Ok":
+        return [[int(d) for d in row] for row in data["distances"]], True, None
+    if data is not None:
         error_msg = f"OSRM respondió con código '{data.get('code')}'"
-    except requests.exceptions.Timeout:
+    elif err_tipo == "timeout":
         error_msg = "OSRM no respondió a tiempo (timeout)."
-    except requests.exceptions.ConnectionError:
+    elif err_tipo == "conexion":
         error_msg = "No se pudo conectar con OSRM (revisá tu conexión a internet)."
-    except Exception as e:
-        error_msg = f"Error inesperado consultando OSRM: {e}"
+    else:
+        error_msg = f"Error inesperado consultando OSRM: {err_tipo}"
     n = len(locations)
     matriz = [[0 if i == j else haversine(locations[i], locations[j]) for j in range(n)] for i in range(n)]
     return matriz, False, error_msg
@@ -166,30 +199,28 @@ def obtener_ruta_completa_osrm_por_leg(stops):
     coords_str = ";".join(f"{lon},{lat}" for lat, lon in stops)
     url = (f"http://router.project-osrm.org/route/v1/driving/{coords_str}"
            f"?overview=full&geometries=geojson&steps=true")
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == "Ok":
-            ruta = data["routes"][0]
-            camino = [(lat, lon) for lon, lat in ruta["geometry"]["coordinates"]]
-            dist_legs = [leg["distance"] for leg in ruta["legs"]]
-            camino_por_tramo = []
-            for leg in ruta["legs"]:
-                puntos_leg = []
-                for step in leg["steps"]:
-                    coords = step["geometry"]["coordinates"]
-                    pts = [(lat, lon) for lon, lat in coords]
-                    puntos_leg.extend(pts if not puntos_leg else pts[1:])
-                camino_por_tramo.append(puntos_leg)
-            return camino, dist_legs, camino_por_tramo, None
+    data, err_tipo = _get_osrm_con_reintentos(url)
+    if data is not None and data.get("code") == "Ok":
+        ruta = data["routes"][0]
+        camino = [(lat, lon) for lon, lat in ruta["geometry"]["coordinates"]]
+        dist_legs = [leg["distance"] for leg in ruta["legs"]]
+        camino_por_tramo = []
+        for leg in ruta["legs"]:
+            puntos_leg = []
+            for step in leg["steps"]:
+                coords = step["geometry"]["coordinates"]
+                pts = [(lat, lon) for lon, lat in coords]
+                puntos_leg.extend(pts if not puntos_leg else pts[1:])
+            camino_por_tramo.append(puntos_leg)
+        return camino, dist_legs, camino_por_tramo, None
+    if data is not None:
         err = f"OSRM código '{data.get('code')}'"
-    except requests.exceptions.Timeout:
+    elif err_tipo == "timeout":
         err = "timeout"
-    except requests.exceptions.ConnectionError:
+    elif err_tipo == "conexion":
         err = "sin conexión"
-    except Exception as e:
-        err = f"error inesperado ({e})"
+    else:
+        err = f"error inesperado ({err_tipo})"
     camino = list(stops)
     dist_legs = [haversine(stops[i], stops[i + 1]) for i in range(len(stops) - 1)]
     camino_por_tramo = [[stops[i], stops[i + 1]] for i in range(len(stops) - 1)]
@@ -209,6 +240,44 @@ def tiempo_leg_velocidad_variable(leg_geom, arbol, tipos_via, velocidad_normal,
     return dist_rapida_km / velocidad_rapida + dist_normal_km / velocidad_normal
 
 
+def multiplicador_horario(hora, franjas):
+    """
+    Multiplicador de velocidad (< 1 = más lento, tráfico) que aplica a la
+    `hora` del día dada (datetime.time), según una lista de franjas
+    horarias configuradas a mano -- no depende de ningún servicio externo
+    de tráfico en vivo (que además suele ser pago), sino de horas pico
+    conocidas de antemano por la municipalidad (ej. calibradas mirando el
+    tráfico típico de Google Maps para sus calles principales).
+
+    franjas: lista de {"inicio": "HH:MM", "fin": "HH:MM", "multiplicador": float}.
+    Fuera de todas las franjas, el multiplicador es 1.0 (velocidad normal).
+    Si dos franjas se superponen para la misma hora, se usa la más
+    restrictiva (el multiplicador más bajo) -- para no subestimar el
+    tráfico por una franja mal configurada.
+    """
+    if not franjas:
+        return 1.0
+
+    mejor = None
+    for franja in franjas:
+        inicio = _hora_desde_str(franja["inicio"])
+        fin = _hora_desde_str(franja["fin"])
+        if inicio <= hora < fin:
+            mult = float(franja["multiplicador"])
+            if mejor is None or mult < mejor:
+                mejor = mult
+    return mejor if mejor is not None else 1.0
+
+
+def _hora_desde_str(valor):
+    """'HH:MM' -> datetime.time. Si ya es un datetime.time (por si se pasa
+    así directamente en vez de vía JSON), se devuelve tal cual."""
+    if isinstance(valor, datetime_time):
+        return valor
+    horas, minutos = valor.split(":")
+    return datetime_time(int(horas), int(minutos))
+
+
 def obtener_ruta_completa_osrm(stops):
     """
     UNA sola llamada OSRM para todo el recorrido de un camión (multi-waypoint).
@@ -221,22 +290,20 @@ def obtener_ruta_completa_osrm(stops):
     coords_str = ";".join(f"{lon},{lat}" for lat, lon in stops)
     url = (f"http://router.project-osrm.org/route/v1/driving/{coords_str}"
            f"?overview=full&geometries=geojson")
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == "Ok":
-            ruta = data["routes"][0]
-            camino = [(lat, lon) for lon, lat in ruta["geometry"]["coordinates"]]
-            dist_legs = [leg["distance"] for leg in ruta["legs"]]
-            return camino, dist_legs, None
+    data, err_tipo = _get_osrm_con_reintentos(url)
+    if data is not None and data.get("code") == "Ok":
+        ruta = data["routes"][0]
+        camino = [(lat, lon) for lon, lat in ruta["geometry"]["coordinates"]]
+        dist_legs = [leg["distance"] for leg in ruta["legs"]]
+        return camino, dist_legs, None
+    if data is not None:
         err = f"OSRM código '{data.get('code')}'"
-    except requests.exceptions.Timeout:
+    elif err_tipo == "timeout":
         err = "timeout"
-    except requests.exceptions.ConnectionError:
+    elif err_tipo == "conexion":
         err = "sin conexión"
-    except Exception as e:
-        err = f"error inesperado ({e})"
+    else:
+        err = f"error inesperado ({err_tipo})"
     # Fallback: línea recta entre paradas
     camino = list(stops)
     dist_legs = [haversine(stops[i], stops[i + 1]) for i in range(len(stops) - 1)]
@@ -529,17 +596,228 @@ def filtrar_camiones_para_grupo(cams, campo_grupo, valor, canton_de_distrito):
     return cams[disponible]
 
 
+def _resultado_de_un_camion(v, viajes_nodos, LOCATIONS, NOMBRES, PESOS, NOMBRES_CAM,
+                            CAPACIDADES, PERSONAS_CAM, VIAJES_MAX_CAM, PLANTEL_CAM,
+                            real_end_coords, hora_inicio, velocidad_kmh, velocidad_variable_via,
+                            velocidad_rapida_kmh, arbol_via, tipos_via_clasif, tiempo_parada,
+                            tiempo_descarga, hora_almuerzo_inicio, hora_almuerzo_fin,
+                            tope_horas_jornada, franjas_trafico, errores_osrm):
+    """
+    Arma el resumen/camino/métricas de UN camión, dado el orden de paradas
+    YA DECIDIDO (viajes_nodos: lista de viajes, cada uno una lista de
+    índices de nodo dentro de LOCATIONS/NOMBRES/PESOS) -- separado de
+    calcular_rutas_para_puntos (que llama a esto una vez por camión, con el
+    orden que decidió el solver) para poder reusar EXACTAMENTE la misma
+    lógica cuando el orden se edita a mano (arrastrar y soltar en la Línea
+    de tiempo de Resultados, ver recalcular_camion_manual) sin volver a
+    correr el optimizador completo ni duplicar este cálculo en dos lugares
+    que podrían divergir.
+
+    Devuelve el dict de resultado de ESE camión (mismo shape que
+    resultado["camiones"][i]), o None si no tiene ningún viaje.
+    `errores_osrm` se modifica in-place, agregándole lo que encuentre.
+    """
+    if not viajes_nodos:
+        return None  # camión sin ningún viaje usado
+
+    hora_actual = datetime.combine(datetime.today(), hora_inicio)
+    hora_inicio_dt = hora_actual  # para medir la duración total de la jornada
+    almuerzo_tomado = False
+    peso_dia = 0
+    orden_counter = 0
+    resumen = []
+    camino_total = []
+    tramos = []  # un tramo dibujable por viaje, con su propio color/selección
+    dist_recoleccion_m = 0.0
+
+    for trip_idx, ruta_nodos in enumerate(viajes_nodos):
+        stops = [LOCATIONS[n] for n in ruta_nodos]
+        camino_por_leg = None
+        if velocidad_variable_via and arbol_via is not None:
+            camino_tramo, dist_legs, camino_por_leg, err = obtener_ruta_completa_osrm_por_leg(stops)
+        else:
+            camino_tramo, dist_legs, err = obtener_ruta_completa_osrm(stops)
+        if err:
+            errores_osrm.append(f"{NOMBRES_CAM[v]} (viaje {trip_idx + 1}): {err}")
+        dist_recoleccion_m += sum(dist_legs)
+        tramos.append({
+            "trip_idx": trip_idx,
+            "etiqueta": f"{NOMBRES_CAM[v]} — Viaje {trip_idx + 1}",
+            "camino": camino_tramo,
+            "dist_m": sum(dist_legs),
+        })
+
+        # Evitar duplicar el punto de unión entre el final de un viaje
+        # y el inicio del siguiente (ambos son el mismo punto físico).
+        camino_total.extend(camino_tramo if trip_idx == 0 else camino_tramo[1:])
+
+        for i, node in enumerate(ruta_nodos):
+            lat, lon = LOCATIONS[node]
+            if i == 0:
+                # El nodo inicial de un viaje POSTERIOR al primero es el
+                # mismo punto físico y el mismo instante que la fila de
+                # "Descarga (fin viaje anterior)" ya agregada — no se
+                # duplica una fila nueva para eso, solo se registra el
+                # inicio real (primer viaje, sale del depot de salida).
+                if trip_idx != 0:
+                    continue
+                resumen.append({
+                    "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "inicio",
+                    "trip_idx": trip_idx,
+                    "Parada": "Inicio (Depot Salida)", "Nombre": NOMBRES[node],
+                    "Hora llegada": hora_actual.strftime("%H:%M"),
+                    "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+                    "Distancia tramo (km)": "-",
+                })
+                orden_counter += 1
+            else:
+                dist_m = dist_legs[i - 1]
+                mult_trafico = multiplicador_horario(hora_actual.time(), franjas_trafico)
+                if camino_por_leg is not None:
+                    horas_tramo = tiempo_leg_velocidad_variable(
+                        camino_por_leg[i - 1], arbol_via, tipos_via_clasif,
+                        velocidad_kmh * mult_trafico, velocidad_rapida_kmh * mult_trafico,
+                        TIPOS_VIA_RAPIDA)
+                else:
+                    horas_tramo = (dist_m / 1000) / (velocidad_kmh * mult_trafico)
+                hora_actual += timedelta(hours=horas_tramo)
+                es_fin_viaje = (i == len(ruta_nodos) - 1)
+                peso_p = PESOS[node] if not es_fin_viaje else 0
+                peso_dia += peso_p
+                tipo = "descarga" if es_fin_viaje else "parada"
+                label = (f"Descarga (fin viaje {trip_idx + 1})" if es_fin_viaje
+                        else f"Parada {orden_counter}")
+                resumen.append({
+                    "orden": orden_counter, "lat": lat, "lon": lon, "tipo": tipo,
+                    "trip_idx": trip_idx,
+                    "Parada": label, "Nombre": NOMBRES[node],
+                    "Hora llegada": hora_actual.strftime("%H:%M"),
+                    "Peso recogido (kg)": peso_p, "Peso acumulado (kg)": peso_dia,
+                    "Distancia tramo (km)": f"{dist_m / 1000:.2f}",
+                })
+                orden_counter += 1
+                if es_fin_viaje:
+                    # Fila informativa: cuándo termina de descargar (usa
+                    # tiempo_descarga, ej. 30 min) y sale vacío rumbo al
+                    # siguiente viaje o de regreso al plantel.
+                    hora_sale_vacio = hora_actual + timedelta(minutes=tiempo_descarga)
+                    resumen.append({
+                        "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "sale_vacio",
+                        "trip_idx": trip_idx,
+                        "Parada": f"Sale vacío ({tiempo_descarga:.0f} min descarga)",
+                        "Nombre": NOMBRES[node],
+                        "Hora llegada": hora_sale_vacio.strftime("%H:%M"),
+                        "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+                        "Distancia tramo (km)": "-",
+                    })
+                    orden_counter += 1
+                hora_actual, almuerzo_tomado, fila_almuerzo = avanzar_reloj_tras_parada(
+                    hora_actual, es_fin_viaje, tiempo_parada, tiempo_descarga,
+                    almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin,
+                )
+                if fila_almuerzo is not None:
+                    resumen.append({
+                        "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "almuerzo",
+                        "trip_idx": trip_idx,
+                        "Parada": "Almuerzo", "Nombre": "—",
+                        "Hora llegada": fila_almuerzo["inicio"].strftime("%H:%M"),
+                        "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+                        "Distancia tramo (km)": "-",
+                    })
+                    orden_counter += 1
+
+    # ── Tramo final: del depot de llegada al plantel de ESE camión ──
+    plantel_coords = PLANTEL_CAM[v]
+    camino_plantel, dist_legs_plantel, err_plantel = obtener_ruta_completa_osrm(
+        [real_end_coords, plantel_coords]
+    )
+    if err_plantel:
+        errores_osrm.append(f"{NOMBRES_CAM[v]} (a plantel): {err_plantel}")
+    dist_plantel_m = sum(dist_legs_plantel) if dist_legs_plantel else 0.0
+    camino_total.extend(camino_plantel[1:] if camino_plantel else [])
+    tramos.append({
+        "trip_idx": len(viajes_nodos),
+        "etiqueta": f"{NOMBRES_CAM[v]} — A plantel",
+        "camino": camino_plantel,
+        "dist_m": dist_plantel_m,
+    })
+    if dist_plantel_m > 0:
+        mult_trafico = multiplicador_horario(hora_actual.time(), franjas_trafico)
+        if arbol_via is not None and camino_plantel:
+            horas_plantel = tiempo_leg_velocidad_variable(
+                camino_plantel, arbol_via, tipos_via_clasif,
+                velocidad_kmh * mult_trafico, velocidad_rapida_kmh * mult_trafico,
+                TIPOS_VIA_RAPIDA)
+        else:
+            horas_plantel = (dist_plantel_m / 1000) / (velocidad_kmh * mult_trafico)
+        hora_actual += timedelta(hours=horas_plantel)
+
+    # Si el mediodía cae durante este último tramo (y no en una parada
+    # anterior), el almuerzo no se salta: se registra acá.
+    hora_actual, almuerzo_tomado, fila_almuerzo = verificar_almuerzo(
+        hora_actual, almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin
+    )
+    if fila_almuerzo is not None:
+        resumen.append({
+            "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
+            "tipo": "almuerzo", "trip_idx": len(viajes_nodos),
+            "Parada": "Almuerzo", "Nombre": "—",
+            "Hora llegada": fila_almuerzo["inicio"].strftime("%H:%M"),
+            "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+            "Distancia tramo (km)": "-",
+        })
+        orden_counter += 1
+
+    resumen.append({
+        "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
+        "tipo": "fin_jornada", "trip_idx": len(viajes_nodos),
+        "Parada": "Fin de jornada (Plantel)", "Nombre": "PLANTEL",
+        "Hora llegada": hora_actual.strftime("%H:%M"),
+        "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
+        "Distancia tramo (km)": f"{dist_plantel_m / 1000:.2f}",
+    })
+
+    horas_jornada = (hora_actual - hora_inicio_dt).total_seconds() / 3600.0
+    return {
+        "nombre": NOMBRES_CAM[v],
+        "capacidad": CAPACIDADES[v],
+        "personas": PERSONAS_CAM[v],
+        "viajes_max": VIAJES_MAX_CAM[v],
+        "n_viajes_usados": len(viajes_nodos),
+        "vehiculo_idx": v,
+        "camino": camino_total,
+        "tramos": tramos,
+        "dist_recoleccion_m": dist_recoleccion_m,
+        "dist_plantel_m": dist_plantel_m,
+        "dist_total_m": dist_recoleccion_m + dist_plantel_m,
+        "resumen": resumen,
+        "peso_total": peso_dia,
+        "hora_fin": hora_actual.strftime("%H:%M"),
+        "horas_jornada": round(horas_jornada, 2),
+        # Restricción BLANDA: nunca bloquea el cálculo, solo marca para
+        # avisar en Resultados — ver docstring de la función.
+        "excede_jornada": horas_jornada > tope_horas_jornada,
+    }
+
+
 def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
                                hora_inicio, velocidad_kmh, tiempo_parada, balancear,
                                velocidad_variable_via=False, velocidad_rapida_kmh=None,
                                tiempo_descarga=None, hora_almuerzo_inicio=None,
                                hora_almuerzo_fin=None, tope_horas_jornada=8.0,
-                               peso_minimo_viaje_extra_kg=0):
+                               peso_minimo_viaje_extra_kg=0, franjas_trafico=None):
     """
     Corre el cálculo completo de rutas para un subconjunto de puntos y la
     flota de camiones dada. Devuelve (resultado, None) si todo salió bien,
     o (None, mensaje_error) si no se pudo calcular — así el que llama decide
     si frena todo (modo clásico) o solo salta ese grupo (modo por lotes).
+
+    franjas_trafico=None (default) reproduce EXACTAMENTE el cálculo de
+    siempre. Si se pasa una lista de franjas horarias (ver
+    multiplicador_horario), la velocidad de cada tramo se ajusta según la
+    hora del día en que el camión pasa por ahí -- sin depender de ningún
+    servicio de tráfico en vivo (que además suele ser pago), solo de
+    horas pico conocidas de antemano.
 
     velocidad_variable_via=False (default) reproduce EXACTAMENTE el cálculo
     de siempre. Si es True, los tramos que atraviesan autopista/vía troncal
@@ -653,183 +931,16 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
     camiones_res = []
     errores_osrm = list(errores_osrm_previos)
     for v, viajes_nodos in enumerate(rutas):
-        if not viajes_nodos:
-            continue  # camión sin ningún viaje usado
-
-        hora_actual = datetime.combine(datetime.today(), hora_inicio)
-        hora_inicio_dt = hora_actual  # para medir la duración total de la jornada
-        almuerzo_tomado = False
-        peso_dia = 0
-        orden_counter = 0
-        resumen = []
-        camino_total = []
-        tramos = []  # un tramo dibujable por viaje, con su propio color/selección
-        dist_recoleccion_m = 0.0
-
-        for trip_idx, ruta_nodos in enumerate(viajes_nodos):
-            stops = [LOCATIONS[n] for n in ruta_nodos]
-            camino_por_leg = None
-            if velocidad_variable_via and arbol_via is not None:
-                camino_tramo, dist_legs, camino_por_leg, err = obtener_ruta_completa_osrm_por_leg(stops)
-            else:
-                camino_tramo, dist_legs, err = obtener_ruta_completa_osrm(stops)
-            if err:
-                errores_osrm.append(f"{NOMBRES_CAM[v]} (viaje {trip_idx + 1}): {err}")
-            dist_recoleccion_m += sum(dist_legs)
-            tramos.append({
-                "trip_idx": trip_idx,
-                "etiqueta": f"{NOMBRES_CAM[v]} — Viaje {trip_idx + 1}",
-                "camino": camino_tramo,
-                "dist_m": sum(dist_legs),
-            })
-
-            # Evitar duplicar el punto de unión entre el final de un viaje
-            # y el inicio del siguiente (ambos son el mismo punto físico).
-            camino_total.extend(camino_tramo if trip_idx == 0 else camino_tramo[1:])
-
-            for i, node in enumerate(ruta_nodos):
-                lat, lon = LOCATIONS[node]
-                if i == 0:
-                    # El nodo inicial de un viaje POSTERIOR al primero es el
-                    # mismo punto físico y el mismo instante que la fila de
-                    # "Descarga (fin viaje anterior)" ya agregada — no se
-                    # duplica una fila nueva para eso, solo se registra el
-                    # inicio real (primer viaje, sale del depot de salida).
-                    if trip_idx != 0:
-                        continue
-                    resumen.append({
-                        "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "inicio",
-                        "trip_idx": trip_idx,
-                        "Parada": "Inicio (Depot Salida)", "Nombre": NOMBRES[node],
-                        "Hora llegada": hora_actual.strftime("%H:%M"),
-                        "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
-                        "Distancia tramo (km)": "-",
-                    })
-                    orden_counter += 1
-                else:
-                    dist_m = dist_legs[i - 1]
-                    if camino_por_leg is not None:
-                        horas_tramo = tiempo_leg_velocidad_variable(
-                            camino_por_leg[i - 1], arbol_via, tipos_via_clasif,
-                            velocidad_kmh, velocidad_rapida_kmh, TIPOS_VIA_RAPIDA)
-                    else:
-                        horas_tramo = (dist_m / 1000) / velocidad_kmh
-                    hora_actual += timedelta(hours=horas_tramo)
-                    es_fin_viaje = (i == len(ruta_nodos) - 1)
-                    peso_p = PESOS[node] if not es_fin_viaje else 0
-                    peso_dia += peso_p
-                    tipo = "descarga" if es_fin_viaje else "parada"
-                    label = (f"Descarga (fin viaje {trip_idx + 1})" if es_fin_viaje
-                            else f"Parada {orden_counter}")
-                    resumen.append({
-                        "orden": orden_counter, "lat": lat, "lon": lon, "tipo": tipo,
-                        "trip_idx": trip_idx,
-                        "Parada": label, "Nombre": NOMBRES[node],
-                        "Hora llegada": hora_actual.strftime("%H:%M"),
-                        "Peso recogido (kg)": peso_p, "Peso acumulado (kg)": peso_dia,
-                        "Distancia tramo (km)": f"{dist_m / 1000:.2f}",
-                    })
-                    orden_counter += 1
-                    if es_fin_viaje:
-                        # Fila informativa: cuándo termina de descargar (usa
-                        # tiempo_descarga, ej. 30 min) y sale vacío rumbo al
-                        # siguiente viaje o de regreso al plantel.
-                        hora_sale_vacio = hora_actual + timedelta(minutes=tiempo_descarga)
-                        resumen.append({
-                            "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "sale_vacio",
-                            "trip_idx": trip_idx,
-                            "Parada": f"Sale vacío ({tiempo_descarga:.0f} min descarga)",
-                            "Nombre": NOMBRES[node],
-                            "Hora llegada": hora_sale_vacio.strftime("%H:%M"),
-                            "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
-                            "Distancia tramo (km)": "-",
-                        })
-                        orden_counter += 1
-                    hora_actual, almuerzo_tomado, fila_almuerzo = avanzar_reloj_tras_parada(
-                        hora_actual, es_fin_viaje, tiempo_parada, tiempo_descarga,
-                        almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin,
-                    )
-                    if fila_almuerzo is not None:
-                        resumen.append({
-                            "orden": orden_counter, "lat": lat, "lon": lon, "tipo": "almuerzo",
-                            "trip_idx": trip_idx,
-                            "Parada": "Almuerzo", "Nombre": "—",
-                            "Hora llegada": fila_almuerzo["inicio"].strftime("%H:%M"),
-                            "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
-                            "Distancia tramo (km)": "-",
-                        })
-                        orden_counter += 1
-
-        # ── Tramo final: del depot de llegada al plantel de ESE camión ──
-        plantel_coords = PLANTEL_CAM[v]
-        camino_plantel, dist_legs_plantel, err_plantel = obtener_ruta_completa_osrm(
-            [real_end_coords, plantel_coords]
+        resultado_camion = _resultado_de_un_camion(
+            v, viajes_nodos, LOCATIONS, NOMBRES, PESOS, NOMBRES_CAM,
+            CAPACIDADES, PERSONAS_CAM, VIAJES_MAX_CAM, PLANTEL_CAM,
+            real_end_coords, hora_inicio, velocidad_kmh, velocidad_variable_via,
+            velocidad_rapida_kmh, arbol_via, tipos_via_clasif, tiempo_parada,
+            tiempo_descarga, hora_almuerzo_inicio, hora_almuerzo_fin,
+            tope_horas_jornada, franjas_trafico, errores_osrm,
         )
-        if err_plantel:
-            errores_osrm.append(f"{NOMBRES_CAM[v]} (a plantel): {err_plantel}")
-        dist_plantel_m = sum(dist_legs_plantel) if dist_legs_plantel else 0.0
-        camino_total.extend(camino_plantel[1:] if camino_plantel else [])
-        tramos.append({
-            "trip_idx": len(viajes_nodos),
-            "etiqueta": f"{NOMBRES_CAM[v]} — A plantel",
-            "camino": camino_plantel,
-            "dist_m": dist_plantel_m,
-        })
-        if dist_plantel_m > 0:
-            if arbol_via is not None and camino_plantel:
-                horas_plantel = tiempo_leg_velocidad_variable(
-                    camino_plantel, arbol_via, tipos_via_clasif,
-                    velocidad_kmh, velocidad_rapida_kmh, TIPOS_VIA_RAPIDA)
-            else:
-                horas_plantel = (dist_plantel_m / 1000) / velocidad_kmh
-            hora_actual += timedelta(hours=horas_plantel)
-
-        # Si el mediodía cae durante este último tramo (y no en una parada
-        # anterior), el almuerzo no se salta: se registra acá.
-        hora_actual, almuerzo_tomado, fila_almuerzo = verificar_almuerzo(
-            hora_actual, almuerzo_tomado, hora_almuerzo_inicio, hora_almuerzo_fin
-        )
-        if fila_almuerzo is not None:
-            resumen.append({
-                "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
-                "tipo": "almuerzo", "trip_idx": len(viajes_nodos),
-                "Parada": "Almuerzo", "Nombre": "—",
-                "Hora llegada": fila_almuerzo["inicio"].strftime("%H:%M"),
-                "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
-                "Distancia tramo (km)": "-",
-            })
-            orden_counter += 1
-
-        resumen.append({
-            "orden": orden_counter, "lat": plantel_coords[0], "lon": plantel_coords[1],
-            "tipo": "fin_jornada", "trip_idx": len(viajes_nodos),
-            "Parada": "Fin de jornada (Plantel)", "Nombre": "PLANTEL",
-            "Hora llegada": hora_actual.strftime("%H:%M"),
-            "Peso recogido (kg)": 0, "Peso acumulado (kg)": peso_dia,
-            "Distancia tramo (km)": f"{dist_plantel_m / 1000:.2f}",
-        })
-
-        horas_jornada = (hora_actual - hora_inicio_dt).total_seconds() / 3600.0
-        camiones_res.append({
-            "nombre": NOMBRES_CAM[v],
-            "capacidad": CAPACIDADES[v],
-            "personas": PERSONAS_CAM[v],
-            "viajes_max": VIAJES_MAX_CAM[v],
-            "n_viajes_usados": len(viajes_nodos),
-            "vehiculo_idx": v,
-            "camino": camino_total,
-            "tramos": tramos,
-            "dist_recoleccion_m": dist_recoleccion_m,
-            "dist_plantel_m": dist_plantel_m,
-            "dist_total_m": dist_recoleccion_m + dist_plantel_m,
-            "resumen": resumen,
-            "peso_total": peso_dia,
-            "hora_fin": hora_actual.strftime("%H:%M"),
-            "horas_jornada": round(horas_jornada, 2),
-            # Restricción BLANDA: nunca bloquea el cálculo, solo marca para
-            # avisar en Resultados — ver docstring de la función.
-            "excede_jornada": horas_jornada > tope_horas_jornada,
-        })
+        if resultado_camion is not None:
+            camiones_res.append(resultado_camion)
 
     if not camiones_res:
         return None, "Ningún camión terminó con una ruta asignada en este grupo."
@@ -842,6 +953,106 @@ def calcular_rutas_para_puntos(puntos, cams, depot2_lat, depot2_lon,
         "hora_inicio": hora_inicio.strftime("%H:%M"),
     }
     return resultado, None
+
+
+def agrupar_paradas_por_capacidad(stops_en_orden, capacidad_kg):
+    """
+    Reparte una lista de paradas (YA EN EL ORDEN deseado) en viajes,
+    respetando la capacidad del camión -- llena cada viaje hasta donde
+    entre y arranca uno nuevo apenas la siguiente parada se pasaría, sin
+    reordenar nada (mismo criterio simple que usaría un despachador a
+    mano). Una parada que sola ya supera la capacidad queda igual en su
+    propio viaje (no hay forma de evitarlo, no es un error).
+    """
+    viajes = []
+    viaje_actual = []
+    peso_actual = 0
+    for parada in stops_en_orden:
+        peso_parada = parada["peso_kg"]
+        if viaje_actual and peso_actual + peso_parada > capacidad_kg:
+            viajes.append(viaje_actual)
+            viaje_actual = []
+            peso_actual = 0
+        viaje_actual.append(parada)
+        peso_actual += peso_parada
+    if viaje_actual:
+        viajes.append(viaje_actual)
+    return viajes
+
+
+def recalcular_camion_manual(nombre_camion, viajes, plantel_lonlat, depot_lonlat, nombre_depot,
+                             capacidad_kg, personas, viajes_max, hora_inicio, velocidad_kmh,
+                             tiempo_parada, tiempo_descarga, hora_almuerzo_inicio=None,
+                             hora_almuerzo_fin=None, tope_horas_jornada=8.0, franjas_trafico=None):
+    """
+    Recalcula el resumen/camino/métricas de UN camión a partir de un orden
+    de paradas elegido A MANO (arrastrar y soltar en la Línea de tiempo de
+    Resultados) -- sin volver a correr el optimizador completo, solo
+    recalcula tiempos y distancias reales (OSRM) para la secuencia armada
+    a mano, reusando la MISMA lógica que el cálculo normal
+    (_resultado_de_un_camion) para que el resultado sea consistente.
+
+    Antes de calcular, las paradas se REAGRUPAN en viajes según la
+    capacidad real del camión (ver agrupar_paradas_por_capacidad) -- si al
+    mover/agregar paradas a mano un viaje quedó con más peso del que el
+    camión puede cargar de una vez, se arman más viajes automáticamente en
+    vez de simular un viaje imposible. Si hacen falta más viajes de los
+    que el camión tiene configurados (viajes_max), NO se bloquea el
+    recálculo (restricción blanda, igual que excede_jornada) -- solo se
+    marca "excede_viajes_max" en el resultado para avisar.
+
+    No aplica "velocidad variable por tipo de vía" (esa opción necesita la
+    red vial clasificada de la zona, que ya no está disponible acá sin
+    volver a descargarla) -- sí aplica franjas de tráfico si se pasan,
+    igual que el resto del cálculo.
+
+    viajes: lista de viajes, cada uno una lista de paradas
+      {"nombre": str, "lat": float, "lon": float, "peso_kg": float}, en el
+      orden deseado (se aplana y se reagrupa por capacidad antes de nada).
+    plantel_lonlat / depot_lonlat: (lon, lat).
+
+    Devuelve (resultado_camion, errores_osrm) -- mismo shape que una
+    entrada de resultado["camiones"], más peso_total_por_viaje_kg y
+    excede_viajes_max.
+    """
+    stops_flat = [s for viaje in viajes for s in viaje]
+    viajes = agrupar_paradas_por_capacidad(stops_flat, capacidad_kg)
+
+    LOCATIONS = (
+        [(plantel_lonlat[1], plantel_lonlat[0])]
+        + [(s["lat"], s["lon"]) for s in stops_flat]
+        + [(depot_lonlat[1], depot_lonlat[0])]
+    )
+    NOMBRES = [f"PLANTEL — {nombre_camion}"] + [s["nombre"] for s in stops_flat] + [nombre_depot]
+    PESOS = [0] + [s["peso_kg"] for s in stops_flat] + [0]
+    idx_depot = len(LOCATIONS) - 1
+
+    viajes_nodos = []
+    cursor = 1
+    for i, viaje in enumerate(viajes):
+        nodos_viaje = list(range(cursor, cursor + len(viaje)))
+        cursor += len(viaje)
+        if i == 0:
+            viajes_nodos.append([0] + nodos_viaje + [idx_depot])
+        else:
+            viajes_nodos.append([idx_depot] + nodos_viaje + [idx_depot])
+
+    errores_osrm = []
+    resultado_camion = _resultado_de_un_camion(
+        0, viajes_nodos, LOCATIONS, NOMBRES, PESOS, [nombre_camion],
+        [capacidad_kg], [personas], [viajes_max], [(plantel_lonlat[1], plantel_lonlat[0])],
+        (depot_lonlat[1], depot_lonlat[0]), hora_inicio, velocidad_kmh, False, None, None, None,
+        tiempo_parada, tiempo_descarga, hora_almuerzo_inicio, hora_almuerzo_fin,
+        tope_horas_jornada, franjas_trafico, errores_osrm,
+    )
+    resultado_camion["peso_total_por_viaje_kg"] = [
+        sum(s["peso_kg"] for s in viaje) for viaje in viajes
+    ]
+    # bool() explícito: viajes_max puede venir como numpy.int64 (viene de
+    # una columna de pandas), y numpy.bool_ no siempre serializa bien a
+    # JSON -- se sanitiza acá para no arrastrar el problema al endpoint.
+    resultado_camion["excede_viajes_max"] = bool(len(viajes) > viajes_max)
+    return resultado_camion, errores_osrm
 
 
 def exportar_geojson(res):
